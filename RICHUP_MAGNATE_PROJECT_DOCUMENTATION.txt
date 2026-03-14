@@ -5,9 +5,11 @@
 Author:       seeds3
 Project Type: Browser-Injected Game Analytics Bot + Full-Stack Live Dashboard
 Stack:        Vanilla JavaScript (client injection), Node.js + Express + WebSocket (server)
-Codebase:     ~2,500 lines (injection script) + ~650 lines (server + frontend)
-Versions:     V18.2 through V18.5, iterated across a single intensive session
-Deployment:   GitHub -> Render auto-deploy (CI/CD)
+Codebase:     ~2,600 lines (V18.5 injection) + ~700 lines (live tracker server/frontend)
+              + ~130 lines (V19.0 injection) + ~80 lines (dashboard server) + ~700 lines (dashboard frontend)
+Versions:     V18.2 through V18.5 (inflation/price tracker), V19.0 (full dashboard)
+Deployment:   GitHub -> Render (manual deploy via Playwright headless browser)
+Repos:        richup-magnate-bot, richup-live-tracker, monopoly-live-dashboard
 
 
 ================================================================================
@@ -21,10 +23,16 @@ gameplay. It intercepts all game communication at the WebSocket layer, maintains
 a parallel model of the complete game state, and exposes a floating GUI dashboard
 with real-time analytics, automated gameplay actions, and financial charting.
 
-The project evolved across four version increments (V18.2 through V18.5) in a
-single development session, culminating in a full-stack deployment: the client-
+The project evolved across four version increments (V18.2 through V18.5) in the
+first development session, culminating in a full-stack deployment: the client-
 side injection script feeds data to a Node.js server on Render, which broadcasts
 live charts to external viewers via WebSocket.
+
+A second session added V19.0: a comprehensive live dashboard (monopoly-live-
+dashboard) that streams the entire game state via Object.defineProperty
+interception and renders all 17 charts from the game's built-in dashboard
+(net worth, spending, earnings, moving averages, stock donuts, bond sparklines,
+gauge meters, and leaderboard) on an external web viewer.
 
 This document serves two purposes:
   (1) A portfolio piece demonstrating the breadth and depth of skills applied.
@@ -663,7 +671,111 @@ V18.5 -- LIVE TRACKER
       * Auto-reconnect with green/red status indicator.
       * Country-based color coding for property series.
   - Dependencies: express ^4.21.0, ws ^8.18.0.
-  - Deployment: GitHub -> Render auto-deploy.
+  - Deployment: GitHub -> Render.
+
+V18.5 POST-RELEASE BUGFIXES (Session 2)
+-----------------------------------------
+  Three critical bugs were discovered and fixed during live testing:
+
+  BUG 1: Chart Glitch on Mid-Game Injection
+    Symptom: Injecting mid-game produced zigzag charts that jumped between
+    turns erratically (e.g., T20 -> T1 -> T21).
+    Root cause: The injection script sent only the LATEST snapshot on connect.
+    The server and viewer had no historical data, and incoming snapshots were
+    appended via blind .push() without turn-order sorting.
+    Fix (3 files):
+      - Injection: onopen now sends 'fullHistory' message containing the
+        complete inflationHistory[] and priceHistory{} arrays.
+      - Server: New 'fullHistory' handler deduplicates by turn number and
+        sorts. All snapshot handling uses upsertByTurn() (find existing turn
+        entry or insert in sorted position) instead of .push().
+      - Viewer: Same upsertByTurn() logic client-side so charts always
+        render in correct turn sequence regardless of arrival order.
+
+  BUG 2: Data Loss on Tab-Switch / Reconnect
+    Symptom: Switching browser tabs caused a brief WS disconnect. On
+    reconnect, the Render dashboard lost all historical data and only showed
+    the last 2-3 turns.
+    Root cause: The original onopen handler sent a 'reset' message on EVERY
+    connect (including reconnects), which wiped the server's in-memory state.
+    Render's free tier also spins down after inactivity, losing all data.
+    Fix: Added _liveFirstConnect flag. 'reset' is only sent on the FIRST
+    connect (fresh injection). Reconnects send only 'fullHistory' to
+    repopulate server state without wiping viewer data.
+
+  BUG 3: Live Tracker WS Hijacking Game Connection (CRITICAL)
+    Symptom: After adding the fullHistory/reset fixes, the entire bot stopped
+    working — GUI appeared but auto-roll, auto-buy, and all game commands
+    were dead.
+    Root cause: The _OriginalWS.prototype.send hook (Method 2 of WS
+    detection) was designed to auto-attach any WebSocket it sees as the game
+    WS if state.ws is null. With the new onopen code, the live tracker WS
+    now called .send() immediately (to transmit 'reset' + 'fullHistory').
+    This triggered the send-hook BEFORE the game WS connected, causing the
+    live tracker WS to be mistakenly attached as state.ws. All subsequent
+    game commands (roll dice, buy property, etc.) were sent to the Render
+    relay server instead of the game server.
+    Fix: Added a guard at the top of the send hook:
+      if (this === _liveWs) return _OriginalSend.apply(this, arguments);
+    This ensures the live tracker WS is never considered as a candidate
+    for game WS attachment.
+    Lesson: When patching prototype methods on shared constructors, any
+    new code path that calls the patched method can trigger unintended
+    side effects. The live tracker used _OriginalWS to bypass the
+    constructor proxy but still inherited the prototype.send patch.
+
+V19.0 -- LIVE DASHBOARD (Session 2, New Repository)
+-----------------------------------------------------
+  A comprehensive external dashboard replacing the limited 2-tab tracker.
+
+  Architecture:
+    - Injection script intercepts window.latestGameState via
+      Object.defineProperty setter (game.js:5113 sets this on every
+      game_state_update socket event).
+    - Full game state object streamed to Render relay server via WebSocket.
+    - Dashboard frontend renders 7 tabs with all 17 charts ported from
+      the game's built-in dashboard (game.js:61-2209).
+
+  Injection Script (V19.0):
+    - Uses Object.defineProperty(window, 'latestGameState', { set(val) {...} })
+    - Debounced 1/sec to avoid flooding.
+    - firstConnect flag: reset only on initial inject, not reconnects.
+    - Sends current _storedGameState on every reconnect.
+    - Minimal GUI overlay: connection dot + "Open Dashboard" link.
+
+  Relay Server (monopoly-live-dashboard/server.js):
+    - Same Express + ws architecture as richup-live-tracker.
+    - /bot endpoint: receives full gameState, stores + broadcasts.
+    - /view endpoint: viewers get fullState on join, updates after.
+    - Simpler than V18.5 server since it stores the opaque game state
+      object rather than managing individual history arrays.
+
+  Dashboard Frontend (public/index.html, ~700 lines):
+    - Chart.js 4.4.1 from CDN for all chart rendering.
+    - 7 tabs:
+        Home     -- activity log, spending doughnut, stocks/bonds overview
+        Charts   -- all 17 line charts (per-player, moving averages, combined)
+        Stocks   -- portfolio cards with ownership doughnut charts
+        Bonds    -- rate history step-chart sparklines, debt/income summaries
+        Payments -- obligations, contracts, rental agreements tables
+        Meters   -- CSS semi-circle gauges (cash health, diversity, risk)
+        LiveStats -- leaderboard, quick stats, net worth + cash trend charts
+    - Timeframe filters: 5T, 10T, 20T, All
+    - Dark theme with CSS variables matching the game's dashboard
+    - Player colors: ['#38bdf8','#4ade80','#c084fc','#f472b6','#fbbf24','#f87171']
+
+  Key Functions Ported from game.js:
+    - getDerivedData() (game.js:933-990) — calculates moving averages,
+      inflation, net flow, earn-spend diff
+    - calcMovingAverage() (game.js:919-929) — 10-turn sliding window
+    - createLineChart() (game.js:1039-1099) — Chart.js config builder
+    - Chart definitions array (game.js:794-818) — all 17 chart configs
+    - _renderStockDonut() (game.js:1207-1265) — ownership doughnut
+    - _renderBondRateHistory() (game.js:1528-1573) — bond rate sparkline
+    - Gauge rendering (game.js:1917-2009) — CSS semi-circle meters
+    - COLORS_MAP for portfolio diversity calculation
+
+  Deployment: GitHub (monopoly-live-dashboard) -> Render free tier web service.
 
 
 ================================================================================
@@ -849,16 +961,56 @@ SECTION 16: FILE MANIFEST
     RICHUP_MAGNATE_CONSOLE_BOT_V18.2_PRICE_CHARTS.txt         (baseline)
     RICHUP_MAGNATE_CONSOLE_BOT_V18.3_INFLATION_TRACKER.txt     (turn-based)
     RICHUP_MAGNATE_CONSOLE_BOT_V18.4_SMART_INFLATION.txt       (bankruptcy)
-    RICHUP_MAGNATE_CONSOLE_BOT_V18.5_LIVE_TRACKER.txt          (full-stack)
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.5_LIVE_TRACKER.txt          (full-stack + bugfixed)
+    RICHUP_MAGNATE_CONSOLE_BOT_V19.0_LIVE_DASHBOARD.txt        (full dashboard)
 
-  Server and frontend (in /home/seeds3/richup-live-tracker/):
-    server.js            -- Express + WebSocket relay server
+  V18.5 Live Tracker (in /home/seeds3/richup-live-tracker/):
+    server.js            -- Express + WebSocket relay (fullHistory, upsertByTurn)
     package.json         -- Project metadata and dependencies
-    public/index.html    -- Viewer frontend (dark-themed SPA)
+    public/index.html    -- Viewer frontend (2-tab: inflation + prices)
+
+  V19.0 Live Dashboard (in /home/seeds3/monopoly-live-dashboard/):
+    server.js            -- Express + WebSocket relay (full gameState passthrough)
+    package.json         -- Project metadata and dependencies
+    render.yaml          -- Render blueprint for one-click deploy
+    public/index.html    -- Full 7-tab dashboard frontend (Chart.js)
 
   Backups (in /home/seeds3/backups/):
     v18.3_inflation_tracker/   -- Snapshot of V18.3 and V18.4 scripts
     v17.2_mortgage_working/    -- Pre-V18 backup (5 incremental versions)
+
+  GitHub Repositories:
+    github.com/anon11413/richup-magnate-bot      -- All injection scripts + docs
+    github.com/anon11413/richup-live-tracker      -- V18.5 relay server + frontend
+    github.com/anon11413/monopoly-live-dashboard  -- V19.0 relay server + frontend
+
+  Render Deployments:
+    richup-live-tracker.onrender.com              -- V18.5 inflation/price tracker
+    monopoly-live-dashboard.onrender.com          -- V19.0 full 7-tab dashboard
+
+
+================================================================================
+SECTION 17: DEPLOYMENT TOOLING
+================================================================================
+
+Render deployments are managed via Playwright headless browser automation using
+a persistent Chromium profile at /home/seeds3/.playwright-render-profile/ which
+maintains login session cookies. This avoids the need for a Render API key.
+
+The deployment flow:
+  1. Push code to GitHub repository.
+  2. Launch Playwright with persistent context (--no-sandbox,
+     --disable-blink-features=AutomationControlled).
+  3. Navigate to the Render dashboard service page.
+  4. Click "Manual Deploy" -> "Deploy latest commit".
+  5. Render builds and deploys from the latest GitHub push.
+
+For new services:
+  1. Navigate to dashboard.render.com/web/new.
+  2. Select "Public Git Repository" tab.
+  3. Enter the GitHub repo URL.
+  4. Render auto-detects Node runtime, build/start commands.
+  5. Select Free tier, click "Deploy Web Service".
 
 
 ================================================================================

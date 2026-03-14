@@ -92,23 +92,25 @@
                     _liveFirstConnect = false;
                 }
 
-                // Build full history dump
-                const prices = {};
-                const propertyNames = {};
-                state.blocks.forEach((b, idx) => {
-                    if (state.priceHistory[idx] && state.priceHistory[idx].length > 0) {
-                        prices[idx] = state.priceHistory[idx];
-                        propertyNames[idx] = { name: b.name || '#' + idx, countryId: b.countryId || '' };
-                    }
-                });
-                _liveWs.send(JSON.stringify({
-                    type: 'fullHistory',
-                    inflationHistory: state.inflationHistory,
-                    priceHistory: prices,
-                    propertyNames: propertyNames,
-                    gameTurn: state.gameTurn,
-                    playerCount: state.participantsOrder.length || Object.keys(state.players).length
-                }));
+                // Build full history dump (only if game data exists)
+                if (state.blocks && state.blocks.length > 0) {
+                    const prices = {};
+                    const propertyNames = {};
+                    state.blocks.forEach((b, idx) => {
+                        if (state.priceHistory[idx] && state.priceHistory[idx].length > 0) {
+                            prices[idx] = state.priceHistory[idx];
+                            propertyNames[idx] = { name: b.name || '#' + idx, countryId: b.countryId || '' };
+                        }
+                    });
+                    _liveWs.send(JSON.stringify({
+                        type: 'fullHistory',
+                        inflationHistory: state.inflationHistory || [],
+                        priceHistory: prices,
+                        propertyNames: propertyNames,
+                        gameTurn: state.gameTurn || 0,
+                        playerCount: (state.participantsOrder || []).length || Object.keys(state.players || {}).length
+                    }));
+                }
             };
             _liveWs.onclose = () => {
                 addLog("LIVE TRACKER: Disconnected", "#ff4757");
@@ -1073,6 +1075,8 @@
 
     // ---- METHOD 2: Send hook (catches heartbeat pongs on existing connections) ----
     _OriginalWS.prototype.send = function(data) {
+        // Skip the live tracker WS — never attach it as the game WS
+        if (this === _liveWs) return _OriginalSend.apply(this, arguments);
         if (!state.ws || state.ws.readyState !== 1) {
             if (this.readyState === 1) {
                 attachToWS(this, 'send-hook');

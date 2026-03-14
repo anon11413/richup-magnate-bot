@@ -1,0 +1,2349 @@
+(function() {
+    console.clear();
+    console.log("%c RICHUP MAGNATE V18.3: INFLATION TRACKER ", "background: #c0392b; color: #fff; font-size: 22px; font-weight: bold; padding: 12px; border: 4px solid #fff;");
+    console.log("%c Paste ANYTIME - before joining, in lobby, mid-game. Injection is fully resilient. ", "background: #2c3e50; color: #ecf0f1; font-size: 12px; padding: 8px;");
+    console.log("%c NEW: Inflation tracker - lobby net worth chart with % change ", "background: #e67e22; color: #fff; font-size: 11px; padding: 4px;");
+    console.log("%c NEW: All charts now turn-based (1 turn = all players go once) ", "background: #8e44ad; color: #fff; font-size: 11px; padding: 4px;");
+    console.log("%c FIX: Net worth uses half property value, $0 for mortgaged ", "background: #27ae60; color: #fff; font-size: 11px; padding: 4px;");
+
+    // ============================================================
+    // CONFIGURATION
+    // ============================================================
+    const CONFIG = {
+        targetName: 'realtor',        // Your nickname (case-insensitive match)
+        // --- Auto-buy trade offers ---
+        // When another player buys a city from a color set you don't own,
+        // auto-offer $500, then $600, $700, $800 (1 min apart).
+        // After all 4 rejected: 5 min cooldown, then restart from $500.
+        offers: [500, 600, 700, 800],
+        offerInterval: 60000,         // 1 minute between escalations
+        offerCooldown: 300000,        // 5 minutes cooldown after exhausting offers
+        // --- Sell markup (reference only - you handle sell trades manually) ---
+        // First 3 color sets: 9x base price. Others: 5x. Plus 16% lobby net worth.
+        highSets: ['brazil', 'israel', 'italy'],
+        highMultiplier: 9,
+        stdMultiplier: 5,
+        tax: 0.16,
+        // --- Gameplay ---
+        autoBuy: true,
+        autoRoll: true,
+        autoDeclineTrades: true,      // ALWAYS decline incoming trades via WS
+        autoMortgage: true,           // Mortgage properties immediately after buying (more cash to buy more)
+    };
+
+    // ============================================================
+    // STATE
+    // ============================================================
+    let state = {
+        ws: null,
+        pid: null,
+        players: {},           // id -> { name, money, position, debtTo, ... }
+        blocks: [],            // Full board (from entered-room / sync-game-state)
+        participantsOrder: [], // Player order array
+        currentPlayerIndex: 0,
+        negs: {},              // blockIndex -> { stage, time, target, cooldownUntil }
+        enabled: true,
+        lobbyNet: 0,
+        // Turn state
+        isMyTurn: false,
+        diceRolled: false,
+        purchaseSent: false,
+        mortgagingDone: true,  // false while mortgage commands are being sent (blocks End turn)
+        lastDice: [0, 0],
+        myPosition: 0,
+        myMoney: 1500,
+        // Turn tracking (1 game turn = all players go once)
+        gameTurn: 0,
+        turnEndedCount: 0,
+        // Price history for charts: { blockIndex: [{turn: N, p: sellPrice}, ...] }
+        priceHistory: {},
+        // Inflation history: [{turn: N, netWorth: $}]
+        inflationHistory: [],
+        inflationFilterTurns: 0,  // 0 = All, otherwise last N turns
+        // Stats
+        stats: { rolls: 0, buys: 0, turns: 0, offered: 0, declined: 0, mortgaged: 0 }
+    };
+
+    // ============================================================
+    // 1. DASHBOARD UI
+    // ============================================================
+    // Clean up previous injection (prevent interval/listener stacking on re-paste)
+    if (window.__magnateMainLoop) clearInterval(window.__magnateMainLoop);
+    if (window.__magnateWsScan) clearInterval(window.__magnateWsScan);
+    if (window.__magnateVisHandler) document.removeEventListener('visibilitychange', window.__magnateVisHandler);
+    if (document.getElementById('mag-v17')) document.getElementById('mag-v17').remove();
+    const ui = document.createElement('div');
+    ui.id = 'mag-v17';
+    ui.style = "position:fixed;top:15px;right:15px;z-index:1000000;width:290px;background:#1e272e;border:2px solid #c0392b;border-radius:12px;color:#fff;font-family:monospace;box-shadow:0 10px 40px rgba(0,0,0,0.8);overflow:hidden;";
+
+    const cbStyle = `accent-color:#2ecc71;width:14px;height:14px;cursor:pointer;vertical-align:middle;`;
+    const lblStyle = `cursor:pointer;font-size:11px;vertical-align:middle;`;
+    ui.innerHTML = `
+        <div style="background:#c0392b;padding:10px;display:flex;justify-content:space-between;align-items:center;font-weight:bold;border-bottom:1px solid #fff;">
+            <span>MAGNATE V18.3</span>
+            <span id="mag-min" style="cursor:pointer;background:rgba(255,255,255,0.2);padding:2px 8px;border-radius:4px;font-size:10px;">MIN</span>
+        </div>
+        <div id="mag-content" style="padding:12px;">
+            <div style="font-size:11px;background:rgba(0,0,0,0.5);padding:10px;border-radius:6px;border:1px solid #34495e;margin-bottom:8px;">
+                WS: <span id="mag-ws" style="color:#ff4757">OFFLINE</span><br>
+                ME: <span id="mag-me" style="color:#f1c40f">SEARCHING...</span> | $<span id="mag-cash" style="color:#2ecc71">?</span><br>
+                TURN: <span id="mag-turn" style="color:#aaa">WAITING</span><br>
+                POS: <span id="mag-pos" style="color:#aaa">0</span> |
+                ROLLS: <span id="mag-rolls" style="color:#2ed573">0</span> |
+                BUYS: <span id="mag-buys" style="color:#3498db">0</span><br>
+                GAME TURN: <span id="mag-gameturn" style="color:#9b59b6">0</span><br>
+                <span style="color:#e67e22;">LOBBY NET:</span> $<span id="mag-net" style="color:#e67e22">0</span> |
+                <span style="color:#e74c3c;">16% TAX:</span> $<span id="mag-tax" style="color:#e74c3c">0</span>
+            </div>
+            <div style="background:rgba(0,0,0,0.3);padding:8px;border-radius:6px;border:1px solid #34495e;margin-bottom:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;">
+                <label style="${lblStyle}"><input type="checkbox" id="mag-cb-roll" checked style="${cbStyle}"> Auto Roll</label>
+                <label style="${lblStyle}"><input type="checkbox" id="mag-cb-buy" checked style="${cbStyle}"> Auto Buy</label>
+                <label style="${lblStyle}"><input type="checkbox" id="mag-cb-endturn" checked style="${cbStyle}"> Auto End Turn</label>
+                <label style="${lblStyle}"><input type="checkbox" id="mag-cb-mortgage" checked style="${cbStyle}"> Auto Mortgage</label>
+            </div>
+            <div id="mag-log" style="height:110px;background:#000;padding:8px;font-size:10px;color:#00ff00;overflow-y:auto;border:1px solid #333;border-radius:4px;margin-bottom:8px;">
+                V18.3 Inflation Tracker ready.
+            </div>
+            <button id="mag-prices" style="width:100%;padding:6px;background:#8e44ad;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:10px;margin-bottom:5px;">COPY SELL PRICES</button>
+            <button id="mag-props-btn" style="width:100%;padding:8px;background:#1abc9c;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:11px;margin-bottom:5px;">MY PROPERTIES</button>
+            <button id="mag-charts-btn" style="width:100%;padding:8px;background:#9b59b6;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:11px;margin-bottom:5px;">PRICE CHARTS</button>
+            <button id="mag-inflation-btn" style="width:100%;padding:8px;background:#e67e22;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:11px;margin-bottom:5px;">INFLATION TRACKER</button>
+            <div style="display:flex;flex-direction:column;gap:5px;">
+                <div style="display:flex;gap:5px;">
+                    <button id="mag-link" style="flex:1;padding:8px;background:#f39c12;color:#000;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:10px;">LINK IDENTITY</button>
+                    <button id="mag-force" style="flex:1;padding:8px;background:#e74c3c;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:10px;">FORCE ROLL</button>
+                </div>
+                <button id="mag-onoff" style="width:100%;padding:10px;background:#2ecc71;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:12px;">BOT: ACTIVE</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(ui);
+
+    // ============================================================
+    // PROPERTIES PANEL (overlay)
+    // ============================================================
+    if (document.getElementById('mag-props-panel')) document.getElementById('mag-props-panel').remove();
+    const propsPanel = document.createElement('div');
+    propsPanel.id = 'mag-props-panel';
+    propsPanel.style = "display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1000001;width:420px;max-height:70vh;background:#1e272e;border:2px solid #1abc9c;border-radius:12px;color:#fff;font-family:monospace;box-shadow:0 15px 50px rgba(0,0,0,0.9);overflow:hidden;";
+    propsPanel.innerHTML = `
+        <div style="background:#1abc9c;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;font-weight:bold;">
+            <span>MY PROPERTIES</span>
+            <span id="mag-props-close" style="cursor:pointer;background:rgba(0,0,0,0.3);padding:2px 10px;border-radius:4px;font-size:12px;">X</span>
+        </div>
+        <div id="mag-props-list" style="padding:10px;overflow-y:auto;max-height:calc(70vh - 90px);"></div>
+        <div style="padding:8px 10px;border-top:1px solid #34495e;display:flex;gap:6px;">
+            <button id="mag-props-copyall" style="flex:1;padding:8px;background:#8e44ad;color:#fff;border:none;border-radius:5px;font-weight:bold;cursor:pointer;font-size:10px;">COPY ALL PRICES</button>
+        </div>
+    `;
+    document.body.appendChild(propsPanel);
+
+    // ============================================================
+    // PRICE CHARTS PANEL (V18.2)
+    // ============================================================
+    if (document.getElementById('mag-charts-panel')) document.getElementById('mag-charts-panel').remove();
+    const chartsPanel = document.createElement('div');
+    chartsPanel.id = 'mag-charts-panel';
+    chartsPanel.style = "display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1000001;width:600px;max-height:85vh;background:#1e272e;border:2px solid #9b59b6;border-radius:12px;color:#fff;font-family:monospace;box-shadow:0 15px 50px rgba(0,0,0,0.9);overflow:hidden;";
+    chartsPanel.innerHTML = `
+        <div style="background:#9b59b6;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;font-weight:bold;">
+            <span>SELL PRICE HISTORY</span>
+            <span id="mag-charts-close" style="cursor:pointer;background:rgba(0,0,0,0.3);padding:2px 10px;border-radius:4px;font-size:12px;">X</span>
+        </div>
+        <div id="mag-charts-body" style="padding:10px;overflow-y:auto;max-height:calc(85vh - 50px);">
+            <div id="mag-charts-legend" style="margin-bottom:8px;font-size:10px;display:flex;flex-wrap:wrap;gap:6px;"></div>
+            <canvas id="mag-charts-canvas" width="560" height="320" style="width:100%;background:#0a0a0a;border:1px solid #333;border-radius:6px;"></canvas>
+            <div id="mag-charts-empty" style="display:none;text-align:center;padding:40px;color:#7f8c8d;font-size:12px;">
+                No price data yet.<br>Own some properties and wait for data to accumulate.
+            </div>
+            <div style="margin-top:8px;font-size:9px;color:#555;text-align:center;">
+                Prices recorded each game turn. Chart shows sell price = (base x multiplier) + 16% lobby tax.
+            </div>
+        </div>
+    `;
+    document.body.appendChild(chartsPanel);
+
+    // ============================================================
+    // INFLATION TRACKER PANEL (V18.3)
+    // ============================================================
+    if (document.getElementById('mag-inflation-panel')) document.getElementById('mag-inflation-panel').remove();
+    const inflationPanel = document.createElement('div');
+    inflationPanel.id = 'mag-inflation-panel';
+    inflationPanel.style = "display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1000001;width:620px;max-height:85vh;background:#1e272e;border:2px solid #e67e22;border-radius:12px;color:#fff;font-family:monospace;box-shadow:0 15px 50px rgba(0,0,0,0.9);overflow:hidden;";
+    inflationPanel.innerHTML = `
+        <div style="background:#e67e22;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;font-weight:bold;">
+            <span>INFLATION TRACKER</span>
+            <span id="mag-inflation-close" style="cursor:pointer;background:rgba(0,0,0,0.3);padding:2px 10px;border-radius:4px;font-size:12px;">X</span>
+        </div>
+        <div id="mag-inflation-body" style="padding:10px;overflow-y:auto;max-height:calc(85vh - 50px);">
+            <div id="mag-inflation-stats" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding:8px;background:rgba(0,0,0,0.5);border-radius:6px;border:1px solid #34495e;">
+                <div style="text-align:center;flex:1;">
+                    <div style="font-size:9px;color:#7f8c8d;">NET WORTH</div>
+                    <div id="mag-inflation-current" style="font-size:16px;font-weight:bold;color:#e67e22;">$0</div>
+                </div>
+                <div style="text-align:center;flex:1;">
+                    <div style="font-size:9px;color:#7f8c8d;">CHANGE ($)</div>
+                    <div id="mag-inflation-change" style="font-size:16px;font-weight:bold;color:#aaa;">$0</div>
+                </div>
+                <div style="text-align:center;flex:1;">
+                    <div style="font-size:9px;color:#7f8c8d;">CHANGE (%)</div>
+                    <div id="mag-inflation-pct" style="font-size:16px;font-weight:bold;color:#aaa;">0.0%</div>
+                </div>
+            </div>
+            <div id="mag-inflation-filters" style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;">
+                <button class="mag-inf-filter" data-turns="0" style="flex:1;padding:5px;background:#e67e22;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">ALL</button>
+                <button class="mag-inf-filter" data-turns="5" style="flex:1;padding:5px;background:#34495e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">5</button>
+                <button class="mag-inf-filter" data-turns="10" style="flex:1;padding:5px;background:#34495e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">10</button>
+                <button class="mag-inf-filter" data-turns="20" style="flex:1;padding:5px;background:#34495e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">20</button>
+                <button class="mag-inf-filter" data-turns="50" style="flex:1;padding:5px;background:#34495e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">50</button>
+                <button class="mag-inf-filter" data-turns="100" style="flex:1;padding:5px;background:#34495e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;">100</button>
+            </div>
+            <canvas id="mag-inflation-canvas" width="580" height="320" style="width:100%;background:#0a0a0a;border:1px solid #333;border-radius:6px;"></canvas>
+            <div id="mag-inflation-empty" style="display:none;text-align:center;padding:40px;color:#7f8c8d;font-size:12px;">
+                No inflation data yet.<br>Data records each game turn (all players go once = 1 turn).
+            </div>
+            <div style="margin-top:8px;font-size:9px;color:#555;text-align:center;">
+                Lobby net worth recorded each game turn. Use filters to zoom into recent turns.
+            </div>
+        </div>
+    `;
+    document.body.appendChild(inflationPanel);
+
+    // --- Chart line colors per country (distinct, high-contrast on dark background) ---
+    const CHART_COLORS = {
+        brazil: '#D2691E', israel: '#00BFFF', italy: '#FF4444',
+        germany: '#FFD700', china: '#00FF7F', france: '#FF69B4',
+        uk: '#4DA6FF', usa: '#DA70D6',
+        default: '#AAAAAA'
+    };
+    let _chartColorIdx = 0;
+    const FALLBACK_COLORS = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
+
+    function getChartColor(countryId) {
+        if (!countryId) return FALLBACK_COLORS[_chartColorIdx++ % FALLBACK_COLORS.length];
+        const key = countryId.toLowerCase();
+        return CHART_COLORS[key] || FALLBACK_COLORS[_chartColorIdx++ % FALLBACK_COLORS.length];
+    }
+
+    // Record current sell prices for all owned properties (called each game turn)
+    function recordPriceSnapshot() {
+        if (!state.pid || state.blocks.length === 0) return;
+        const turn = state.gameTurn;
+        state.blocks.forEach((b, idx) => {
+            if (b.ownerId === state.pid && b.type === 'city') {
+                const price = getSellPrice(idx);
+                if (!state.priceHistory[idx]) {
+                    state.priceHistory[idx] = [];
+                }
+                const hist = state.priceHistory[idx];
+                // Only record one entry per turn
+                if (hist.length === 0 || hist[hist.length - 1].turn !== turn) {
+                    hist.push({ turn: turn, p: price });
+                } else {
+                    // Same turn — update price (may have changed within the turn)
+                    hist[hist.length - 1].p = price;
+                }
+                // No cap — show full history from game start
+            }
+        });
+    }
+
+    // Record lobby net worth snapshot (called each game turn)
+    function recordInflationSnapshot() {
+        const turn = state.gameTurn;
+        const hist = state.inflationHistory;
+        if (hist.length === 0 || hist[hist.length - 1].turn !== turn) {
+            hist.push({ turn: turn, netWorth: state.lobbyNet });
+        } else {
+            hist[hist.length - 1].netWorth = state.lobbyNet;
+        }
+    }
+
+    // Render the charts on canvas
+    function renderCharts() {
+        const canvas = document.getElementById('mag-charts-canvas');
+        const legendEl = document.getElementById('mag-charts-legend');
+        const emptyEl = document.getElementById('mag-charts-empty');
+        if (!canvas || !legendEl) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.width;
+        const H = canvas.height;
+
+        // Gather all properties with history
+        const series = [];
+        _chartColorIdx = 0;
+        state.blocks.forEach((b, idx) => {
+            if (state.priceHistory[idx] && state.priceHistory[idx].length >= 2) {
+                series.push({
+                    idx,
+                    name: b.name || `#${idx}`,
+                    country: b.countryId || 'default',
+                    color: getChartColor(b.countryId),
+                    data: state.priceHistory[idx]
+                });
+            }
+        });
+
+        if (series.length === 0) {
+            canvas.style.display = 'none';
+            emptyEl.style.display = '';
+            legendEl.innerHTML = '';
+            return;
+        }
+        canvas.style.display = '';
+        emptyEl.style.display = 'none';
+
+        // Build legend
+        legendEl.innerHTML = series.map(s =>
+            `<span style="display:inline-flex;align-items:center;gap:3px;">` +
+            `<span style="display:inline-block;width:12px;height:3px;background:${s.color};border-radius:1px;"></span>` +
+            `<span style="color:${s.color};">${s.name}</span>` +
+            `</span>`
+        ).join('');
+
+        // Find global turn range and price range (show full history from turn 0)
+        let tMin = 0, tMax = state.gameTurn, pMin = Infinity, pMax = -Infinity;
+        series.forEach(s => {
+            s.data.forEach(d => {
+                if (d.turn > tMax) tMax = d.turn;
+                if (d.p < pMin) pMin = d.p;
+                if (d.p > pMax) pMax = d.p;
+            });
+        });
+
+        // Add padding to price range
+        const pRange = pMax - pMin || 1;
+        pMin = Math.max(0, pMin - pRange * 0.1);
+        pMax = pMax + pRange * 0.1;
+        const tRange = tMax - tMin || 1;
+
+        // Chart area margins
+        const mLeft = 55, mRight = 15, mTop = 15, mBottom = 35;
+        const cW = W - mLeft - mRight;
+        const cH = H - mTop - mBottom;
+
+        // Clear canvas
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(0, 0, W, H);
+
+        // Draw grid
+        ctx.strokeStyle = '#1a1a2e';
+        ctx.lineWidth = 1;
+        // Horizontal grid lines (price)
+        const numYLines = 6;
+        for (let i = 0; i <= numYLines; i++) {
+            const y = mTop + (cH * i / numYLines);
+            ctx.beginPath();
+            ctx.moveTo(mLeft, y);
+            ctx.lineTo(W - mRight, y);
+            ctx.stroke();
+            // Price label
+            const price = pMax - ((pMax - pMin) * i / numYLines);
+            ctx.fillStyle = '#555';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('$' + Math.round(price), mLeft - 5, y + 3);
+        }
+
+        // Vertical grid lines (turns)
+        const numXLines = Math.min(tMax - tMin, 10) || 5;
+        for (let i = 0; i <= numXLines; i++) {
+            const x = mLeft + (cW * i / numXLines);
+            ctx.beginPath();
+            ctx.moveTo(x, mTop);
+            ctx.lineTo(x, mTop + cH);
+            ctx.stroke();
+            // Turn label
+            const turnNum = Math.round(tMin + (tRange * i / numXLines));
+            ctx.fillStyle = '#555';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(`T${turnNum}`, x, H - mBottom + 15);
+        }
+
+        // X-axis label
+        ctx.fillStyle = '#444';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('game turns (1 turn = all players go once)', mLeft + cW / 2, H - 3);
+
+        // Draw each series
+        series.forEach(s => {
+            ctx.strokeStyle = s.color;
+            ctx.lineWidth = 2;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            let first = true;
+            s.data.forEach(d => {
+                const x = mLeft + ((d.turn - tMin) / tRange) * cW;
+                const y = mTop + ((pMax - d.p) / (pMax - pMin)) * cH;
+                if (first) { ctx.moveTo(x, y); first = false; }
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            // Draw current price dot at the end
+            const last = s.data[s.data.length - 1];
+            const lx = mLeft + ((last.turn - tMin) / tRange) * cW;
+            const ly = mTop + ((pMax - last.p) / (pMax - pMin)) * cH;
+            ctx.fillStyle = s.color;
+            ctx.beginPath();
+            ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Current price label at end
+            ctx.fillStyle = s.color;
+            ctx.font = 'bold 9px monospace';
+            ctx.textAlign = 'left';
+            const labelX = Math.min(lx + 5, W - mRight - 40);
+            ctx.fillText('$' + last.p, labelX, ly - 5);
+        });
+
+        // Chart border
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(mLeft, mTop, cW, cH);
+    }
+
+    // Render the inflation tracker chart
+    function renderInflationChart() {
+        const canvas = document.getElementById('mag-inflation-canvas');
+        const emptyEl = document.getElementById('mag-inflation-empty');
+        const currentEl = document.getElementById('mag-inflation-current');
+        const changeEl = document.getElementById('mag-inflation-change');
+        const pctEl = document.getElementById('mag-inflation-pct');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const W = canvas.width;
+        const H = canvas.height;
+
+        // Filter data based on selected turn range
+        let data = state.inflationHistory.slice();
+        if (state.inflationFilterTurns > 0 && data.length > 0) {
+            const maxTurn = data[data.length - 1].turn;
+            const minTurn = maxTurn - state.inflationFilterTurns;
+            data = data.filter(d => d.turn >= minTurn);
+        }
+
+        if (data.length < 2) {
+            canvas.style.display = 'none';
+            if (emptyEl) emptyEl.style.display = '';
+            // Still update stats with current values
+            if (currentEl) currentEl.innerText = '$' + state.lobbyNet;
+            if (changeEl) { changeEl.innerText = '$0'; changeEl.style.color = '#aaa'; }
+            if (pctEl) { pctEl.innerText = '0.0%'; pctEl.style.color = '#aaa'; }
+            return;
+        }
+        canvas.style.display = '';
+        if (emptyEl) emptyEl.style.display = 'none';
+
+        // Update stats based on visible range
+        const firstVisible = data[0];
+        const lastVisible = data[data.length - 1];
+        const dollarChange = lastVisible.netWorth - firstVisible.netWorth;
+        const pctChange = firstVisible.netWorth !== 0
+            ? ((lastVisible.netWorth - firstVisible.netWorth) / firstVisible.netWorth * 100)
+            : 0;
+
+        if (currentEl) currentEl.innerText = '$' + lastVisible.netWorth.toLocaleString();
+        if (changeEl) {
+            const sign = dollarChange >= 0 ? '+' : '';
+            changeEl.innerText = sign + '$' + dollarChange.toLocaleString();
+            changeEl.style.color = dollarChange >= 0 ? '#2ecc71' : '#e74c3c';
+        }
+        if (pctEl) {
+            const sign = pctChange >= 0 ? '+' : '';
+            pctEl.innerText = sign + pctChange.toFixed(1) + '%';
+            pctEl.style.color = pctChange >= 0 ? '#2ecc71' : '#e74c3c';
+        }
+
+        // Find turn range and value range
+        const tMin = data[0].turn;
+        const tMax = data[data.length - 1].turn;
+        let vMin = Infinity, vMax = -Infinity;
+        data.forEach(d => {
+            if (d.netWorth < vMin) vMin = d.netWorth;
+            if (d.netWorth > vMax) vMax = d.netWorth;
+        });
+
+        const vRange = vMax - vMin || 1;
+        vMin = Math.max(0, vMin - vRange * 0.1);
+        vMax = vMax + vRange * 0.1;
+        const tRange = tMax - tMin || 1;
+
+        // Chart area margins
+        const mLeft = 65, mRight = 15, mTop = 15, mBottom = 35;
+        const cW = W - mLeft - mRight;
+        const cH = H - mTop - mBottom;
+
+        // Clear canvas
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(0, 0, W, H);
+
+        // Draw grid
+        ctx.strokeStyle = '#1a1a2e';
+        ctx.lineWidth = 1;
+
+        // Horizontal grid lines (value)
+        const numYLines = 6;
+        for (let i = 0; i <= numYLines; i++) {
+            const y = mTop + (cH * i / numYLines);
+            ctx.beginPath();
+            ctx.moveTo(mLeft, y);
+            ctx.lineTo(W - mRight, y);
+            ctx.stroke();
+            const val = vMax - ((vMax - vMin) * i / numYLines);
+            ctx.fillStyle = '#555';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('$' + Math.round(val).toLocaleString(), mLeft - 5, y + 3);
+        }
+
+        // Vertical grid lines (turns)
+        const numXLines = Math.min(tMax - tMin, 10) || 5;
+        for (let i = 0; i <= numXLines; i++) {
+            const x = mLeft + (cW * i / numXLines);
+            ctx.beginPath();
+            ctx.moveTo(x, mTop);
+            ctx.lineTo(x, mTop + cH);
+            ctx.stroke();
+            const turnNum = Math.round(tMin + (tRange * i / numXLines));
+            ctx.fillStyle = '#555';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(`T${turnNum}`, x, H - mBottom + 15);
+        }
+
+        // X-axis label
+        ctx.fillStyle = '#444';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('game turns', mLeft + cW / 2, H - 3);
+
+        // Draw the net worth line
+        const isUp = lastVisible.netWorth >= firstVisible.netWorth;
+        const lineColor = isUp ? '#2ecc71' : '#e74c3c';
+
+        // Fill area under the line
+        ctx.beginPath();
+        data.forEach((d, i) => {
+            const x = mLeft + ((d.turn - tMin) / tRange) * cW;
+            const y = mTop + ((vMax - d.netWorth) / (vMax - vMin)) * cH;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        // Close the area to the bottom
+        const lastX = mLeft + ((data[data.length - 1].turn - tMin) / tRange) * cW;
+        const firstX = mLeft + ((data[0].turn - tMin) / tRange) * cW;
+        ctx.lineTo(lastX, mTop + cH);
+        ctx.lineTo(firstX, mTop + cH);
+        ctx.closePath();
+        ctx.fillStyle = isUp ? 'rgba(46, 204, 113, 0.15)' : 'rgba(231, 76, 60, 0.15)';
+        ctx.fill();
+
+        // Draw the line
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = 2.5;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        data.forEach((d, i) => {
+            const x = mLeft + ((d.turn - tMin) / tRange) * cW;
+            const y = mTop + ((vMax - d.netWorth) / (vMax - vMin)) * cH;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // Draw current value dot at the end
+        const last = data[data.length - 1];
+        const lx = mLeft + ((last.turn - tMin) / tRange) * cW;
+        const ly = mTop + ((vMax - last.netWorth) / (vMax - vMin)) * cH;
+        ctx.fillStyle = lineColor;
+        ctx.beginPath();
+        ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Current value label
+        ctx.fillStyle = lineColor;
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'left';
+        const labelX = Math.min(lx + 6, W - mRight - 60);
+        ctx.fillText('$' + last.netWorth.toLocaleString(), labelX, ly - 6);
+
+        // Chart border
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(mLeft, mTop, cW, cH);
+    }
+
+    // Color map for visual indicators
+    const COLOR_MAP = {
+        brazil: '#8B4513', israel: '#87CEEB', italy: '#e74c3c',
+        germany: '#f39c12', china: '#2ecc71', france: '#e91e63',
+        uk: '#3498db', usa: '#9b59b6',
+        // Fallbacks
+        default: '#7f8c8d'
+    };
+
+    function getCountryColor(countryId) {
+        if (!countryId) return COLOR_MAP.default;
+        const key = countryId.toLowerCase();
+        return COLOR_MAP[key] || COLOR_MAP.default;
+    }
+
+    function buildPropertiesList() {
+        const listEl = document.getElementById('mag-props-list');
+        if (!listEl) return;
+
+        const owned = [];
+        state.blocks.forEach((b, idx) => {
+            if (b.ownerId === state.pid && b.type === 'city') {
+                const mult = CONFIG.highSets.includes(b.countryId) ? CONFIG.highMultiplier : CONFIG.stdMultiplier;
+                const baseMarkup = b.price * mult;
+                const lobbyTax = Math.floor(state.lobbyNet * CONFIG.tax);
+                const sellPrice = Math.floor(baseMarkup + lobbyTax);
+                owned.push({ idx, name: b.name, country: b.countryId, base: b.price, mult, sellPrice, lobbyTax });
+            }
+        });
+
+        if (owned.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;padding:20px;color:#7f8c8d;font-size:12px;">No properties owned yet.<br>Buy some properties first!</div>';
+            return;
+        }
+
+        // Group by country
+        const grouped = {};
+        owned.forEach(p => {
+            if (!grouped[p.country]) grouped[p.country] = [];
+            grouped[p.country].push(p);
+        });
+
+        let html = '';
+        for (const country of Object.keys(grouped).sort()) {
+            const props = grouped[country];
+            const color = getCountryColor(country);
+            const mult = props[0].mult;
+            html += `<div style="margin-bottom:8px;">`;
+            html += `<div style="font-size:10px;color:#aaa;padding:2px 0;border-bottom:1px solid #34495e;margin-bottom:4px;">
+                <span style="display:inline-block;width:10px;height:10px;background:${color};border-radius:2px;vertical-align:middle;margin-right:4px;"></span>
+                ${country.toUpperCase()} (${mult}x)
+            </div>`;
+            for (const p of props) {
+                html += `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 4px;background:rgba(0,0,0,0.3);border-radius:4px;margin-bottom:3px;">
+                    <div style="flex:1;">
+                        <div style="font-size:11px;font-weight:bold;color:#ecf0f1;">${p.name}</div>
+                        <div style="font-size:9px;color:#7f8c8d;">Base $${p.base} x${p.mult} + $${p.lobbyTax} tax = <span style="color:#2ecc71;font-weight:bold;">$${p.sellPrice}</span></div>
+                    </div>
+                    <button class="mag-prop-copy" data-name="${p.name}" data-price="${p.sellPrice}" style="padding:4px 10px;background:#1abc9c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:10px;font-weight:bold;white-space:nowrap;">COPY</button>
+                </div>`;
+            }
+            html += `</div>`;
+        }
+        listEl.innerHTML = html;
+
+        // Attach copy handlers
+        listEl.querySelectorAll('.mag-prop-copy').forEach(btn => {
+            btn.onclick = (e) => {
+                e.stopPropagation();
+                const name = btn.dataset.name;
+                const price = btn.dataset.price;
+                const text = `${name} - $${price}`;
+                copyToClipboard(text);
+                btn.innerText = 'COPIED!';
+                btn.style.background = '#2ecc71';
+                setTimeout(() => { btn.innerText = 'COPY'; btn.style.background = '#1abc9c'; }, 1500);
+                addLog(`Copied: ${text}`, "#1abc9c");
+            };
+        });
+    }
+
+    function copyToClipboard(text) {
+        navigator.clipboard.writeText(text).catch(() => {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;opacity:0;';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        });
+    }
+
+    // Checkbox → CONFIG binding (read live from checkboxes)
+    function isAutoRoll() { return document.getElementById('mag-cb-roll')?.checked ?? true; }
+    function isAutoBuy() { return document.getElementById('mag-cb-buy')?.checked ?? true; }
+    function isAutoEndTurn() { return document.getElementById('mag-cb-endturn')?.checked ?? true; }
+    function isAutoMortgage() { return document.getElementById('mag-cb-mortgage')?.checked ?? true; }
+
+    const addLog = (m, c = "#00ff00") => {
+        const l = document.getElementById('mag-log');
+        if (l) {
+            const d = document.createElement('div');
+            d.style.color = c;
+            d.innerText = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${m}`;
+            l.prepend(d);
+            // Cap log at 200 entries to prevent DOM bloat over long sessions
+            while (l.children.length > 200) l.removeChild(l.lastChild);
+        }
+    };
+
+    function updateStatsUI() {
+        const el = (id) => document.getElementById(id);
+        if (el('mag-rolls')) el('mag-rolls').innerText = state.stats.rolls;
+        if (el('mag-buys')) el('mag-buys').innerText = state.stats.buys;
+        if (el('mag-cash')) el('mag-cash').innerText = state.myMoney;
+        if (el('mag-pos')) el('mag-pos').innerText = state.myPosition;
+        if (el('mag-gameturn')) el('mag-gameturn').innerText = state.gameTurn;
+    }
+
+    function updateMeUI(name) {
+        const el = document.getElementById('mag-me');
+        if (el) { el.innerText = name.toUpperCase(); el.style.color = '#2ecc71'; }
+    }
+
+    // ============================================================
+    // 2. WS COMMAND SENDER
+    // ============================================================
+    function wsSend(eventName, payload) {
+        if (!state.ws) { addLog("NO WS CONNECTION", "#ff4757"); return false; }
+        try {
+            const msg = payload !== undefined
+                ? `42/api/game,${JSON.stringify([eventName, payload])}`
+                : `42/api/game,${JSON.stringify([eventName])}`;
+            state.ws.send(msg);
+            addLog(`TX: ${eventName}`, "#3498db");
+            return true;
+        } catch (e) {
+            addLog(`TX FAIL: ${e.message}`, "#ff4757");
+            return false;
+        }
+    }
+
+    // ============================================================
+    // 3. WEBSOCKET HIJACK (IRONCLAD - works at any injection timing)
+    // ============================================================
+    let _wsAttachCount = 0;       // Track how many times we've attached (for reconnection)
+    const _attachedWsSeen = new WeakSet(); // Prevent duplicate listeners on same WS object
+    let _wsScanTimer = null;      // Scan interval reference (also stored as window.__magnateWsScan)
+    let _wsScanRate = 500;        // Start fast, slow down once connected
+    let _wsScanAttempts = 0;
+
+    function attachToWS(ws, source) {
+        // Allow re-attach if previous WS is dead
+        if (state.ws && state.ws.readyState === 1) return;
+        // Prevent duplicate listeners on the same WS object
+        if (_attachedWsSeen.has(ws)) {
+            state.ws = ws; // Update reference but don't re-add listeners
+            return;
+        }
+        _attachedWsSeen.add(ws);
+        if (state.ws && state.ws !== ws) {
+            addLog(`WS RECONNECT (old was ${state.ws.readyState})`, "#f39c12");
+        }
+
+        state.ws = ws;
+        _wsAttachCount++;
+        document.getElementById('mag-ws').innerText = 'ONLINE';
+        document.getElementById('mag-ws').style.color = '#2ecc71';
+        addLog(`WS HIJACKED #${_wsAttachCount} (${source})`, "#2ecc71");
+
+        // Listen for messages
+        ws.addEventListener('message', (e) => handleMessage(e.data));
+
+        // CRITICAL: Listen for close/error to auto-reconnect
+        ws.addEventListener('close', () => {
+            addLog("WS CLOSED - scanning for new connection...", "#ff4757");
+            document.getElementById('mag-ws').innerText = 'RECONNECTING';
+            document.getElementById('mag-ws').style.color = '#f39c12';
+            state.ws = null;
+            startWSScan(); // Restart scanning
+        });
+        ws.addEventListener('error', () => {
+            addLog("WS ERROR - will reconnect on close", "#ff4757");
+        });
+
+        // Request full game state from server (critical for mid-game injection)
+        // Multiple attempts at increasing intervals to handle various timings
+        const syncDelays = [500, 2000, 5000, 10000, 20000];
+        syncDelays.forEach((delay, i) => {
+            setTimeout(() => {
+                if (state.ws !== ws) return; // WS changed, stop
+                if (i > 0 && state.pid && state.blocks.length > 0) return; // Already synced
+                wsSend("request-sync", { snapshot: "0" });
+                if (i === 0) addLog("Requested game state sync...", "#f39c12");
+                else addLog(`Sync retry #${i + 1}...`, "#f39c12");
+            }, delay);
+        });
+
+        // DOM-based state recovery at multiple intervals
+        [1000, 3000, 6000, 12000].forEach(delay => {
+            setTimeout(() => {
+                if (state.ws !== ws) return;
+                syncStateFromDOM();
+            }, delay);
+        });
+
+        // Slow down the scanner now that we're connected
+        if (_wsScanTimer) { clearInterval(_wsScanTimer); _wsScanTimer = null; }
+    }
+
+    // Detect game state from DOM when injected mid-game
+    let _lastDomRollTime = 0; // Prevent double-roll from DOM scan + WS event overlap
+
+    function syncStateFromDOM() {
+        if (!state.ws) return;
+
+        // Check for Roll button (indicates it's our turn)
+        const rollBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find(el => {
+            const text = (el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
+            return text.includes('roll') && el.offsetWidth > 0 && !el.closest('#mag-v17');
+        });
+        if (rollBtn && !isInsideTradeUI(rollBtn)) {
+            // Only act if we haven't already detected our turn and haven't rolled yet
+            if (!state.isMyTurn) {
+                addLog("Detected ROLL button - it's our turn!", "#f1c40f");
+                state.isMyTurn = true;
+                state.diceRolled = false;
+            }
+            // Guard: don't send roll if dice already rolled or if we rolled recently (prevents double-roll)
+            const now = Date.now();
+            if (state.enabled && isAutoRoll() && !state.diceRolled && (now - _lastDomRollTime > 3000)) {
+                _lastDomRollTime = now;
+                wsSend("plz-roll-dices");
+                state.stats.rolls++;
+                updateStatsUI();
+            }
+        }
+
+        // Try to recover block/player state from React fiber tree
+        if (state.blocks.length === 0) {
+            recoverStateFromReactFiber();
+        }
+
+        // Try to detect our identity from the page if we don't have it
+        if (!state.pid) {
+            recoverIdentityFromDOM();
+        }
+    }
+
+    // Crawl React fiber tree to find game state (board blocks, players)
+    function recoverStateFromReactFiber() {
+        try {
+            const appRoot = document.getElementById('root') || document.getElementById('app') || document.querySelector('[data-reactroot]');
+            if (!appRoot) return;
+            const fiberKey = Object.keys(appRoot).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+            if (!fiberKey) return;
+            let fiber = appRoot[fiberKey];
+            let depth = 0;
+            const visited = new Set();
+            while (fiber && depth < 50) {
+                if (visited.has(fiber)) break;
+                visited.add(fiber);
+                const s = fiber.memoizedState;
+                const p = fiber.memoizedProps;
+                // Look for game state in memoizedState/props
+                if (s && s.memoizedState && Array.isArray(s.memoizedState.blocks)) {
+                    state.blocks = s.memoizedState.blocks;
+                    addLog(`Recovered ${state.blocks.length} blocks from fiber!`, "#2ecc71");
+                }
+                if (p && Array.isArray(p.blocks) && p.blocks.length > 10) {
+                    state.blocks = p.blocks;
+                    addLog(`Recovered ${state.blocks.length} blocks from fiber props!`, "#2ecc71");
+                }
+                if (p && p.participants && Array.isArray(p.participants)) {
+                    p.participants.forEach(pl => { if (pl.id) state.players[pl.id] = pl; });
+                }
+                fiber = fiber.child || fiber.sibling || fiber.return;
+                depth++;
+            }
+        } catch (e) { /* fiber crawl failed, not critical */ }
+    }
+
+    // Try to find our identity from DOM elements showing player name
+    function recoverIdentityFromDOM() {
+        if (state.pid) return;
+        // Look for elements that contain our target name
+        try {
+            const allText = document.querySelectorAll('span, div, p');
+            for (const el of allText) {
+                if (el.offsetWidth === 0) continue;
+                if (el.closest('#mag-v17') || el.closest('#mag-props-panel')) continue;
+                const text = (el.innerText || '').trim();
+                if (text.toLowerCase() === CONFIG.targetName.toLowerCase()) {
+                    // Found our name on screen - check if there's player data in fiber
+                    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+                    if (fiberKey) {
+                        let fiber = el[fiberKey];
+                        let d = 0;
+                        while (fiber && d < 15) {
+                            const props = fiber.memoizedProps;
+                            if (props && props.player && props.player.id) {
+                                lockIdentity(props.player);
+                                return;
+                            }
+                            fiber = fiber.return;
+                            d++;
+                        }
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    // ---- METHOD 1: WebSocket Constructor Proxy (catches ALL future connections) ----
+    const _OriginalWS = window.WebSocket;
+    const _OriginalSend = _OriginalWS.prototype.send;
+    window.WebSocket = function(...args) {
+        const ws = new _OriginalWS(...args);
+        addLog(`New WS created: ${(args[0]||'').toString().slice(0,50)}`, "#3498db");
+        // Check if this is a game WebSocket (Socket.IO connects to /socket.io/ or /api/)
+        const url = (args[0] || '').toString();
+        if (url.includes('socket.io') || url.includes('/api/') || url.includes('richup')) {
+            // Wait for it to open, then attach
+            ws.addEventListener('open', () => {
+                if (!state.ws || state.ws.readyState !== 1) {
+                    setTimeout(() => attachToWS(ws, 'constructor-proxy'), 300);
+                }
+            });
+        }
+        // Also expose it globally for compatibility
+        window.activeWS = ws;
+        return ws;
+    };
+    // Preserve prototype chain
+    window.WebSocket.prototype = _OriginalWS.prototype;
+    window.WebSocket.CONNECTING = _OriginalWS.CONNECTING;
+    window.WebSocket.OPEN = _OriginalWS.OPEN;
+    window.WebSocket.CLOSING = _OriginalWS.CLOSING;
+    window.WebSocket.CLOSED = _OriginalWS.CLOSED;
+
+    // ---- METHOD 2: Send hook (catches heartbeat pongs on existing connections) ----
+    _OriginalWS.prototype.send = function(data) {
+        if (!state.ws || state.ws.readyState !== 1) {
+            if (this.readyState === 1) {
+                attachToWS(this, 'send-hook');
+            }
+        }
+        return _OriginalSend.apply(this, arguments);
+    };
+
+    // ---- METHOD 3: Immediate check for existing connections ----
+    if (window.activeWS && window.activeWS.readyState === 1) {
+        attachToWS(window.activeWS, 'activeWS');
+    }
+
+    // ---- METHOD 4: Aggressive repeating scanner with adaptive rate ----
+    function deepScanForWS() {
+        // Check known globals
+        const knownKeys = ['activeWS', '_ws', 'socket', 'ws', 'gameSocket', 'io'];
+        for (const key of knownKeys) {
+            try {
+                const val = window[key];
+                if (val instanceof _OriginalWS && val.readyState === 1) {
+                    attachToWS(val, 'global-' + key);
+                    return true;
+                }
+            } catch(e) {}
+        }
+
+        // Deep scan: search ALL window properties for WebSocket instances (3 levels deep)
+        try {
+            for (const key of Object.getOwnPropertyNames(window)) {
+                try {
+                    const val = window[key];
+                    if (val instanceof _OriginalWS && val.readyState === 1) {
+                        attachToWS(val, 'deep-' + key);
+                        return true;
+                    }
+                    if (val && typeof val === 'object' && !Array.isArray(val)) {
+                        for (const k2 of Object.keys(val)) {
+                            try {
+                                const v2 = val[k2];
+                                if (v2 instanceof _OriginalWS && v2.readyState === 1) {
+                                    attachToWS(v2, 'deep-' + key + '.' + k2);
+                                    return true;
+                                }
+                                // Socket.IO nests deeply: manager.engine.transport.ws
+                                if (v2 && typeof v2 === 'object') {
+                                    for (const k3 of Object.keys(v2)) {
+                                        try {
+                                            const v3 = v2[k3];
+                                            if (v3 instanceof _OriginalWS && v3.readyState === 1) {
+                                                attachToWS(v3, 'deep-' + key + '.' + k2 + '.' + k3);
+                                                return true;
+                                            }
+                                            if (v3 && typeof v3 === 'object') {
+                                                for (const k4 of Object.keys(v3)) {
+                                                    try {
+                                                        const v4 = v3[k4];
+                                                        if (v4 instanceof _OriginalWS && v4.readyState === 1) {
+                                                            attachToWS(v4, 'deep-' + key + '.' + k2 + '.' + k3 + '.' + k4);
+                                                            return true;
+                                                        }
+                                                    } catch(e) {}
+                                                }
+                                            }
+                                        } catch(e) {}
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+
+        // Socket.IO specific: look for io.Manager instances
+        try {
+            if (window.io && window.io.managers) {
+                for (const url of Object.keys(window.io.managers)) {
+                    const mgr = window.io.managers[url];
+                    if (mgr && mgr.engine && mgr.engine.transport && mgr.engine.transport.ws) {
+                        const ws = mgr.engine.transport.ws;
+                        if (ws instanceof _OriginalWS && ws.readyState === 1) {
+                            attachToWS(ws, 'io-manager');
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch(e) {}
+
+        return false;
+    }
+
+    function startWSScan() {
+        if (_wsScanTimer) clearInterval(_wsScanTimer);
+        _wsScanRate = 500; // Start fast
+        _wsScanAttempts = 0;
+
+        function scanTick() {
+            _wsScanAttempts++;
+
+            // If we already have a live WS, stop scanning
+            if (state.ws && state.ws.readyState === 1) {
+                clearInterval(_wsScanTimer);
+                _wsScanTimer = null;
+                return;
+            }
+
+            // Clear dead WS reference
+            if (state.ws && state.ws.readyState !== 1) {
+                state.ws = null;
+            }
+
+            const found = deepScanForWS();
+            if (found) {
+                clearInterval(_wsScanTimer);
+                _wsScanTimer = null;
+                return;
+            }
+
+            // Adaptive rate: speed up initially, then slow down
+            // 500ms for first 20 attempts (10s), then 2s for next 30 (60s), then 5s forever
+            if (_wsScanAttempts === 20 && _wsScanRate === 500) {
+                clearInterval(_wsScanTimer);
+                _wsScanRate = 2000;
+                _wsScanTimer = setInterval(scanTick, _wsScanRate);
+                addLog("WS scan: slowing to 2s interval...", "#aaa");
+            } else if (_wsScanAttempts === 50 && _wsScanRate === 2000) {
+                clearInterval(_wsScanTimer);
+                _wsScanRate = 5000;
+                _wsScanTimer = setInterval(scanTick, _wsScanRate);
+                addLog("WS scan: slowing to 5s interval...", "#aaa");
+            }
+
+            // Log progress periodically
+            if (_wsScanAttempts % 10 === 0) {
+                addLog(`WS scan: ${_wsScanAttempts} attempts, waiting for connection...`, "#7f8c8d");
+            }
+        }
+
+        _wsScanTimer = setInterval(scanTick, _wsScanRate);
+        window.__magnateWsScan = _wsScanTimer;
+    }
+
+    // ---- METHOD 5: MutationObserver - detect when game UI loads ----
+    const _domObserver = new MutationObserver((mutations) => {
+        // If we don't have WS yet, each DOM change is a chance to find it
+        if (!state.ws || state.ws.readyState !== 1) {
+            deepScanForWS();
+        }
+        // If we have WS but no identity, check for name appearing
+        if (state.ws && !state.pid) {
+            recoverIdentityFromDOM();
+        }
+    });
+    _domObserver.observe(document.body, { childList: true, subtree: true });
+    // Stop observing after 2 minutes to save performance
+    setTimeout(() => _domObserver.disconnect(), 120000);
+
+    // ---- METHOD 6: Page visibility handler (re-check on tab focus) ----
+    window.__magnateVisHandler = () => {
+        if (!document.hidden && (!state.ws || state.ws.readyState !== 1)) {
+            addLog("Tab focused - re-scanning for WS...", "#f39c12");
+            deepScanForWS();
+            if (!state.ws) startWSScan();
+        }
+    };
+    document.addEventListener('visibilitychange', window.__magnateVisHandler);
+
+    // Start the initial scan
+    startWSScan();
+
+    // ============================================================
+    // 4. EVENT-DRIVEN PROTOCOL HANDLER (THE BRAIN)
+    // ============================================================
+    function handleMessage(payload) {
+        if (typeof payload !== 'string') return;
+        if (!payload.startsWith('42/api/game,')) return;
+
+        try {
+            const raw = payload.substring(payload.indexOf('['));
+            const parsed = JSON.parse(raw);
+            const ev = parsed[0];
+            const body = parsed[1] || {};
+
+            switch (ev) {
+                case 'entered-room':     handleEnteredRoom(body); break;
+                case 'joined-game':      handleJoinedGame(body); break;
+                case 'player-joined':    handlePlayerJoined(body); break;
+                case 'game-started':     handleGameStarted(body); break;
+                case 'plz-roll-dices':   handlePlzRollDices(); break;
+                case 'dice-rolled':      handleDiceRolled(body); break;
+                case 'purchase-success': handlePurchaseSuccess(body); break;
+                case 'turn-ended':       handleTurnEnded(); break;
+                case 'money-changed':    handleMoneyChanged(body); break;
+                case 'sync-game-state':  handleSyncGameState(body); break;
+                case 'trade-created':    handleTradeCreated(body); break;
+                case 'trade-declined':   handleTradeDeclined(body); break;
+                case 'trade-confirmed':  handleTradeConfirmed(body); break;
+                case 'game-error':       handleGameError(body); break;
+                case 'game-room-updated':
+                    if (body.settings) addLog("Settings updated", "#aaa");
+                    break;
+                case 'city-level-changed':
+                    // Track house/hotel building (affects net worth calculation)
+                    if (body.blockIndex !== undefined && state.blocks[body.blockIndex]) {
+                        state.blocks[body.blockIndex].level = body.level || 0;
+                        addLog(`Building: #${body.blockIndex} now level ${body.level}`, "#aaa");
+                    }
+                    break;
+                case 'property-mortgaged':
+                    // Track other players' mortgages (affects net worth)
+                    if (body.blockIndex !== undefined && state.blocks[body.blockIndex]) {
+                        state.blocks[body.blockIndex].isMortgaged = true;
+                        addLog(`Mortgaged: ${state.blocks[body.blockIndex].name || '#' + body.blockIndex}`, "#aaa");
+                    }
+                    break;
+                case 'property-unmortgaged':
+                    if (body.blockIndex !== undefined && state.blocks[body.blockIndex]) {
+                        state.blocks[body.blockIndex].isMortgaged = false;
+                        addLog(`Unmortgaged: ${state.blocks[body.blockIndex].name || '#' + body.blockIndex}`, "#aaa");
+                    }
+                    break;
+                case 'paid-out-of-prison':
+                    addLog("Paid out of prison", "#f39c12");
+                    break;
+                // V18.1 FIX: Handle player removal events to keep lobbyNet accurate
+                case 'player-left':
+                case 'player-bankrupt':
+                case 'player-eliminated':
+                case 'player-disconnected':
+                case 'player-removed':
+                    handlePlayerRemoved(body, ev);
+                    break;
+                default:
+                    // Catch property-bought events (broadcast when others buy)
+                    if (ev === 'property-bought' || (typeof ev === 'string' && ev.includes('bought'))) {
+                        handleOtherPlayerBought(body);
+                    }
+                    // V18.1 FIX: Catch any other player-departure event names we didn't list
+                    if (typeof ev === 'string' && (ev.includes('bankrupt') || ev.includes('eliminated') || ev.includes('player-left') || ev.includes('player-removed'))) {
+                        handlePlayerRemoved(body, ev);
+                    }
+                    break;
+            }
+
+            // Identity scan on all messages
+            scanForIdentity(body);
+
+        } catch (e) { /* parse error, ignore non-game messages */ }
+    }
+
+    // --- Room & Identity ---
+    function handleEnteredRoom(body) {
+        state.blocks = body.room?.blocks || state.blocks;
+        state.currentPlayerIndex = body.room?.currentPlayerIndex || 0;
+        (body.room?.participants || []).forEach(p => { state.players[p.id] = p; });
+        addLog(`Entered room: ${state.blocks.length} blocks, ${Object.keys(state.players).length} players`, "#2ecc71");
+    }
+
+    function handleJoinedGame(body) {
+        if (body.selfPlayer) {
+            // Always update player data, but only set pid if not already locked
+            // (LINK IDENTITY manual override takes priority)
+            if (!state.pid) {
+                state.pid = body.selfPlayer.id;
+                updateMeUI(body.selfPlayer.name);
+                addLog(`Identity: ${body.selfPlayer.name} (${state.pid.slice(0,8)})`, "#2ecc71");
+            }
+            state.players[body.selfPlayer.id] = body.selfPlayer;
+            if (body.selfPlayer.id === state.pid) {
+                state.myPosition = body.selfPlayer.position || 0;
+                state.myMoney = (typeof body.selfPlayer.money === 'number') ? body.selfPlayer.money : 1500;
+                updateStatsUI();
+            }
+        }
+    }
+
+    function handlePlayerJoined(body) {
+        if (body.id) state.players[body.id] = body;
+        addLog(`Player joined: ${body.name}`, "#aaa");
+    }
+
+    function handleGameStarted(body) {
+        state.participantsOrder = body.participantsOrder || [];
+        state.participantsOrder.forEach(p => { state.players[p.id] = p; });
+        state.currentPlayerIndex = 0;
+        addLog(`GAME STARTED! ${state.participantsOrder.length} players`, "#f1c40f");
+
+        const myIdx = state.participantsOrder.findIndex(p => p.id === state.pid);
+        if (myIdx >= 0) {
+            addLog(`We are player #${myIdx + 1} in order`, "#2ecc71");
+            if (myIdx === 0) {
+                addLog("We're FIRST - auto-rolling!", "#f1c40f");
+                setTimeout(() => handlePlzRollDices(), 1500);
+            }
+        }
+        // Mortgaging happens on our turn (see handleDiceRolled)
+
+        // V18.3: Record initial state at turn 0
+        state.gameTurn = 0;
+        state.turnEndedCount = 0;
+        state.inflationHistory = [];
+        state.priceHistory = {};
+        setTimeout(() => {
+            recalcLobbyNet();
+            recordInflationSnapshot();
+            recordPriceSnapshot();
+        }, 2000);
+    }
+
+    // --- Full state sync (periodic from server) ---
+    function handleSyncGameState(body) {
+        const gs = body.gameState;
+        if (!gs) return;
+        state.blocks = gs.blocks || state.blocks;
+        state.currentPlayerIndex = gs.currentPlayerIndex || 0;
+        if (gs.participantsOrder) {
+            state.participantsOrder = gs.participantsOrder;
+        }
+
+        const participants = gs.participants || gs.participantsOrder || [];
+        // Replace players map with fresh data to remove bankrupt/disconnected players
+        const freshPlayers = {};
+        participants.forEach(p => {
+            freshPlayers[p.id] = p;
+            if (p.id === state.pid) {
+                state.myPosition = p.position || 0;
+                state.myMoney = (typeof p.money === 'number') ? p.money : 0;
+                if (p.debtTo) {
+                    addLog(`DEBT detected to ${p.debtTo}!`, "#ff4757");
+                    tryMortgage();
+                }
+            }
+        });
+        // Replace state.players with fresh data (removes bankrupt/disconnected players)
+        state.players = freshPlayers;
+
+        // Identity detection: if we don't have pid yet, find ourselves
+        if (!state.pid && participants.length > 0) {
+            // Method 1: Match by targetName
+            const byName = participants.find(p =>
+                p.name && p.name.toLowerCase().includes(CONFIG.targetName.toLowerCase()));
+            if (byName) {
+                lockIdentity(byName);
+            } else {
+                // Method 2: Only non-bot human player
+                const humans = participants.filter(p => !p.isBot);
+                if (humans.length === 1) {
+                    lockIdentity(humans[0]);
+                } else if (humans.length > 1) {
+                    addLog(`${humans.length} humans found. Use LINK IDENTITY.`, "#ff4757");
+                }
+            }
+        }
+
+        // Update our money from players if we have identity
+        if (state.pid && state.players[state.pid]) {
+            state.myMoney = state.players[state.pid].money || 0;
+            state.myPosition = state.players[state.pid].position || 0;
+        }
+
+        addLog(`Synced: ${participants.length} players, ${state.blocks.length} blocks`, "#2ecc71");
+        updateStatsUI();
+        // Mortgage on sync only if it's our turn (skip if already mortgaging)
+        if (state.isMyTurn && state.enabled && isAutoMortgage() && state.mortgagingDone) {
+            state.mortgagingDone = false;
+            // Safety timeout: force mortgagingDone=true after 30s to prevent stuck turns
+            const _mortSafe1 = setTimeout(() => { state.mortgagingDone = true; }, 30000);
+            setTimeout(() => {
+                mortgageAllOnTurn(() => { state.mortgagingDone = true; clearTimeout(_mortSafe1); });
+            }, 1000);
+        }
+    }
+
+    // --- Turn Flow ---
+    function handlePlzRollDices() {
+        state.isMyTurn = true;
+        state.diceRolled = false;
+        state.purchaseSent = false;
+        document.getElementById('mag-turn').innerText = 'MY TURN!';
+        document.getElementById('mag-turn').style.color = '#2ecc71';
+        addLog(">>> MY TURN - ROLLING <<<", "#f1c40f");
+
+        if (state.enabled && isAutoRoll()) {
+            setTimeout(() => {
+                if (state.isMyTurn && !state.diceRolled) {
+                    wsSend("plz-roll-dices");
+                    state.stats.rolls++;
+                    updateStatsUI();
+                }
+            }, 300 + Math.random() * 500);
+        }
+    }
+
+    function handleDiceRolled(body) {
+        state.diceRolled = true;
+        state.purchaseSent = false;
+        state.lastDice = body.dice || [0, 0];
+        const total = state.lastDice[0] + state.lastDice[1];
+        const isDoubles = state.lastDice[0] === state.lastDice[1] && state.lastDice[0] > 0;
+        state.myPosition = (state.myPosition + total) % (state.blocks.length || 40);
+
+        addLog(`Dice: [${state.lastDice}] = ${total} -> pos ${state.myPosition}${isDoubles ? ' DOUBLES!' : ''}`, isDoubles ? "#f1c40f" : "#3498db");
+        updateStatsUI();
+
+        // Auto-buy: send purchase-property, let server reject if not applicable
+        if (state.isMyTurn && state.enabled && isAutoBuy()) {
+            setTimeout(() => {
+                if (!state.purchaseSent) {
+                    state.purchaseSent = true;
+                    wsSend("purchase-property");
+                }
+            }, 500 + Math.random() * 500);
+        }
+
+        // Click safe game buttons as fallback (Buy/Pass/Pay/OK)
+        setTimeout(() => clickSafeButtons(), 1500);
+        setTimeout(() => clickSafeButtons(), 3000);
+
+        // After purchase attempt, mortgage all unmortgaged properties via UI clicks
+        if (state.isMyTurn && state.enabled && isAutoMortgage()) {
+            state.mortgagingDone = false;
+            // Safety timeout: force mortgagingDone=true after 30s to prevent stuck turns
+            const _mortSafe2 = setTimeout(() => { state.mortgagingDone = true; addLog("Mortgage safety timeout - unblocking End Turn", "#ff4757"); }, 30000);
+            setTimeout(() => {
+                mortgageAllOnTurn(() => {
+                    state.mortgagingDone = true;
+                    clearTimeout(_mortSafe2);
+                    addLog("Mortgaging complete", "#2ecc71");
+                    // If doubles, re-roll now that mortgaging is done
+                    if (isDoubles && state.isMyTurn && state.enabled && isAutoRoll()) {
+                        setTimeout(() => {
+                            if (state.isMyTurn && state.diceRolled) {
+                                state.diceRolled = false;
+                                state.purchaseSent = false;
+                                addLog("Re-rolling for DOUBLES...", "#f1c40f");
+                                wsSend("plz-roll-dices");
+                                state.stats.rolls++;
+                                updateStatsUI();
+                            }
+                        }, 500);
+                    }
+                });
+            }, 2000);
+        } else if (isDoubles && state.isMyTurn && state.enabled && isAutoRoll()) {
+            // DOUBLES without mortgage: re-roll after a short delay
+            addLog("DOUBLES detected - will re-roll!", "#f1c40f");
+            setTimeout(() => {
+                if (state.isMyTurn && state.diceRolled) {
+                    state.diceRolled = false;
+                    state.purchaseSent = false;
+                    addLog("Re-rolling for DOUBLES...", "#f1c40f");
+                    wsSend("plz-roll-dices");
+                    state.stats.rolls++;
+                    updateStatsUI();
+                }
+            }, 3000);
+        }
+    }
+
+    function handlePurchaseSuccess(body) {
+        const bIdx = body.blockIndex;
+        const currentPlayer = getCurrentPlayerId();
+        // Determine who bought: if it's our turn, it's us. Otherwise it's the current player.
+        const isOurPurchase = state.isMyTurn || currentPlayer === state.pid || !currentPlayer;
+        const buyerId = isOurPurchase ? state.pid : currentPlayer;
+
+        if (state.blocks[bIdx]) {
+            state.blocks[bIdx].ownerId = buyerId;
+        }
+
+        if (isOurPurchase) {
+            state.stats.buys++;
+            addLog(`BOUGHT: ${state.blocks[bIdx]?.name || '#' + bIdx}`, "#2ecc71");
+            updateStatsUI();
+        } else {
+            // Someone else bought - the periodic scan will pick it up for negotiation
+            const name = state.players[buyerId]?.name || '?';
+            addLog(`${name} bought ${state.blocks[bIdx]?.name || '#' + bIdx}`, "#aaa");
+        }
+    }
+
+    function handleTurnEnded() {
+        const wasMyTurn = state.isMyTurn;
+        state.isMyTurn = false;
+        state.diceRolled = false;
+        state.purchaseSent = false;
+
+        const prevIdx = state.currentPlayerIndex;
+        state.currentPlayerIndex = (state.currentPlayerIndex + 1) % (state.participantsOrder.length || 4);
+
+        // Track individual turn-ended events for game turn calculation
+        state.turnEndedCount++;
+
+        // Detect new full game turn (all players went once)
+        // When currentPlayerIndex wraps back to 0, one full round completed
+        if (state.currentPlayerIndex === 0 && prevIdx > 0 && state.participantsOrder.length > 0) {
+            state.gameTurn++;
+            const gtEl = document.getElementById('mag-gameturn');
+            if (gtEl) gtEl.innerText = state.gameTurn;
+            addLog(`GAME TURN ${state.gameTurn} complete`, "#9b59b6");
+            // Record snapshots at each game turn
+            recalcLobbyNet();  // Ensure fresh net worth
+            recordPriceSnapshot();
+            recordInflationSnapshot();
+        }
+
+        document.getElementById('mag-turn').innerText = 'WAITING';
+        document.getElementById('mag-turn').style.color = '#aaa';
+
+        if (wasMyTurn) {
+            state.stats.turns++;
+            updateStatsUI();
+            addLog(`My turn complete (#${state.stats.turns})`, "#aaa");
+        }
+    }
+
+    function handleMoneyChanged(body) {
+        if (state.players[body.playerId]) {
+            state.players[body.playerId].money = body.money;
+        }
+        if (body.playerId === state.pid) {
+            state.myMoney = body.money;
+            addLog(`Money: $${body.money}`, "#f1c40f");
+            updateStatsUI();
+            // If in debt (negative money), try to mortgage
+            if (body.money < 0) {
+                addLog(`IN DEBT: $${body.money} - mortgaging...`, "#ff4757");
+                tryMortgage();
+            }
+        }
+    }
+
+    function handleGameError(body) {
+        if (body.message === 'This is not your turn') {
+            state.isMyTurn = false;
+        } else {
+            addLog(`ERR: ${body.message}`, "#ff4757");
+        }
+    }
+
+    // V18.1 FIX: Handle player leaving/bankrupt/eliminated
+    // Removes the player from state.players so their cash no longer inflates lobbyNet.
+    // Clears ownerId on their properties so those don't inflate lobbyNet either.
+    // Cleans up any active negotiations targeting the gone player.
+    function handlePlayerRemoved(body, eventName) {
+        const removedId = body.playerId || body.id;
+        if (!removedId) {
+            // Some events send the player object directly
+            if (body.player && body.player.id) {
+                handlePlayerRemoved({ playerId: body.player.id }, eventName);
+            }
+            return;
+        }
+
+        const playerName = state.players[removedId]?.name || removedId.slice(0, 8);
+        addLog(`PLAYER GONE: ${playerName} (${eventName})`, "#ff4757");
+
+        // Remove from players map — their cash drops out of lobbyNet calculation
+        delete state.players[removedId];
+
+        // Clear ownerId on all their properties — property value drops out of lobbyNet
+        state.blocks.forEach((b, idx) => {
+            if (b.ownerId === removedId) {
+                b.ownerId = null;
+            }
+        });
+
+        // Remove from participantsOrder (affects turn tracking)
+        if (state.participantsOrder.length > 0) {
+            const oldLen = state.participantsOrder.length;
+            const removedIdx = state.participantsOrder.findIndex(p => p.id === removedId);
+            if (removedIdx >= 0) {
+                state.participantsOrder.splice(removedIdx, 1);
+                // Adjust currentPlayerIndex if needed
+                if (removedIdx < state.currentPlayerIndex) {
+                    state.currentPlayerIndex = Math.max(0, state.currentPlayerIndex - 1);
+                } else if (state.currentPlayerIndex >= state.participantsOrder.length) {
+                    state.currentPlayerIndex = 0;
+                }
+            }
+        }
+
+        // Cancel any negotiations targeting the gone player
+        for (const bIdx in state.negs) {
+            if (state.negs[bIdx].target === removedId) {
+                addLog(`Cancelled negotiation for #${bIdx} (player gone)`, "#aaa");
+                delete state.negs[bIdx];
+            }
+        }
+
+        // Force immediate lobbyNet recalculation so the dashboard updates right away
+        recalcLobbyNet();
+
+        // Also request a fresh sync from server to stay accurate
+        if (state.ws) {
+            setTimeout(() => wsSend("request-sync", { snapshot: "0" }), 2000);
+        }
+    }
+
+    // ============================================================
+    // 5. TRADE HANDLING (CRITICAL SAFETY)
+    // ============================================================
+
+    // AUTO-DECLINE incoming trades via WebSocket - NEVER accept trades from the bot
+    function handleTradeCreated(body) {
+        const trade = body.trade;
+        if (!trade) return;
+
+        addLog(`Trade: ${trade.initiatorId?.slice(0,6)} -> ${trade.recipientId?.slice(0,6)}`, "#f39c12");
+
+        // If WE are the recipient, AUTO-DECLINE immediately
+        if (trade.recipientId === state.pid && CONFIG.autoDeclineTrades) {
+            setTimeout(() => {
+                wsSend("decline-trade", { tradeId: trade.id });
+                state.stats.declined++;
+                addLog(`AUTO-DECLINED trade ${trade.id.slice(0,8)}`, "#ff4757");
+            }, 500 + Math.random() * 1000);
+        }
+
+        // If WE are the initiator, track it
+        if (trade.initiatorId === state.pid) {
+            addLog(`Our trade offer sent: ${trade.id.slice(0,8)}`, "#3498db");
+        }
+    }
+
+    function handleTradeDeclined(body) {
+        addLog(`Trade declined: ${body.tradeId?.slice(0,8)}`, "#aaa");
+    }
+
+    function handleTradeConfirmed(body) {
+        addLog(`Trade confirmed: ${body.tradeId?.slice(0,8)}`, "#2ecc71");
+        // Update block ownership from trade data (critical for accurate net worth)
+        if (body.trade) {
+            const t = body.trade;
+            // Properties moving from initiator to recipient
+            if (t.myOffer?.blockIndices) {
+                t.myOffer.blockIndices.forEach(idx => {
+                    if (state.blocks[idx]) state.blocks[idx].ownerId = t.recipientId;
+                });
+            }
+            // Properties moving from recipient to initiator
+            if (t.theirOffer?.blockIndices) {
+                t.theirOffer.blockIndices.forEach(idx => {
+                    if (state.blocks[idx]) state.blocks[idx].ownerId = t.initiatorId;
+                });
+            }
+        }
+        // Request fresh sync to ensure accuracy
+        setTimeout(() => wsSend("request-sync", { snapshot: "0" }), 1000);
+    }
+
+    // ============================================================
+    // 6. AUTO-BUY TRADE OFFERS (Negotiation System)
+    // ============================================================
+
+    // Get color sets we own at least 1 property from
+    function getMyColorSets() {
+        const sets = new Set();
+        state.blocks.forEach(b => {
+            if (b.type === 'city' && b.ownerId === state.pid && b.countryId) {
+                sets.add(b.countryId);
+            }
+        });
+        return sets;
+    }
+
+    // Check if a block is a valid auto-buy target
+    function isValidBuyTarget(blockIndex) {
+        const block = state.blocks[blockIndex];
+        if (!block) return false;
+        // Must be a city (not airport, company, corner, bonus)
+        if (block.type !== 'city') return false;
+        // Must be owned by someone else
+        if (!block.ownerId || block.ownerId === state.pid) return false;
+        // Must NOT be from a color set we already own a piece of
+        const mySets = getMyColorSets();
+        if (mySets.has(block.countryId)) return false;
+        return true;
+    }
+
+    // Triggered when another player buys a property
+    function handleOtherPlayerBought(body) {
+        const bIdx = body.blockIndex;
+        const pId = body.playerId || getCurrentPlayerId();
+        if (bIdx === undefined || !pId || pId === state.pid) return;
+
+        // Update block ownership
+        if (state.blocks[bIdx]) {
+            state.blocks[bIdx].ownerId = pId;
+        }
+
+        // Check if this is a valid negotiation target
+        if (!isValidBuyTarget(bIdx)) return;
+
+        // Don't duplicate existing negotiation
+        if (state.negs[bIdx]) return;
+
+        const block = state.blocks[bIdx];
+        const playerName = state.players[pId]?.name || pId.slice(0,8);
+        addLog(`TARGET: ${block.name} (${block.countryId}) owned by ${playerName}`, "#f39c12");
+        state.negs[bIdx] = {
+            stage: 0,
+            time: 0,            // Will fire on first check
+            target: pId,
+            cooldownUntil: 0
+        };
+    }
+
+    // Periodic scan: find all blocks owned by others that qualify for negotiation
+    function scanForNegotiationTargets() {
+        if (!state.pid || state.blocks.length === 0) return;
+        state.blocks.forEach((block, idx) => {
+            if (!isValidBuyTarget(idx)) return;
+            if (state.negs[idx]) return; // Already tracking
+            const playerName = state.players[block.ownerId]?.name || block.ownerId?.slice(0,8) || '?';
+            addLog(`TARGET: ${block.name} (${block.countryId}) owned by ${playerName}`, "#f39c12");
+            state.negs[idx] = {
+                stage: 0,
+                time: 0,
+                target: block.ownerId,
+                cooldownUntil: 0
+            };
+        });
+    }
+
+    // Get current player based on turn index
+    function getCurrentPlayerId() {
+        if (state.participantsOrder.length > 0 && state.currentPlayerIndex < state.participantsOrder.length) {
+            return state.participantsOrder[state.currentPlayerIndex].id;
+        }
+        return null;
+    }
+
+    // Run negotiation cycle (called from main loop)
+    function runNegotiations() {
+        if (!state.ws || !state.pid) return;
+        const now = Date.now();
+
+        for (const bIdx in state.negs) {
+            const n = state.negs[bIdx];
+
+            // Re-validate: if we now own a property in this color set, cancel negotiation
+            if (!isValidBuyTarget(parseInt(bIdx))) {
+                addLog(`Cancelling neg for #${bIdx} (no longer valid)`, "#aaa");
+                delete state.negs[bIdx];
+                continue;
+            }
+
+            // Check if in cooldown
+            if (n.cooldownUntil > 0 && now < n.cooldownUntil) continue;
+
+            // Reset after cooldown expires
+            if (n.cooldownUntil > 0 && now >= n.cooldownUntil) {
+                n.stage = 0;
+                n.cooldownUntil = 0;
+                addLog(`Cooldown over for #${bIdx}, restarting offers`, "#f39c12");
+            }
+
+            // All offers exhausted? Start cooldown
+            if (n.stage >= CONFIG.offers.length) {
+                n.cooldownUntil = now + CONFIG.offerCooldown;
+                addLog(`All offers exhausted for #${bIdx}, 5min cooldown`, "#aaa");
+                continue;
+            }
+
+            // Time for next offer?
+            if (now - n.time < CONFIG.offerInterval) continue;
+
+            // Cash check: don't offer more than we have
+            const amt = CONFIG.offers[n.stage];
+            if (state.myMoney < amt) {
+                addLog(`Skip offer $${amt} for #${bIdx} (only $${state.myMoney})`, "#ff4757");
+                continue; // Don't advance stage, just wait until we have money
+            }
+
+            // Send trade offer
+            const block = state.blocks[parseInt(bIdx)];
+            const targetName = state.players[n.target]?.name || '?';
+            wsSend("create-trade", {
+                targetPlayerId: n.target,
+                initiatorOffer: { money: amt, propertyIndices: [], mortgagedPropertiesIndexes: [], pardonCards: [] },
+                recipientOffer: { money: 0, propertyIndices: [parseInt(bIdx)], mortgagedPropertiesIndexes: [], pardonCards: [] }
+            });
+            n.time = now;
+            n.stage++;
+            state.stats.offered++;
+            addLog(`OFFER: $${amt} to ${targetName} for ${block?.name || '#'+bIdx}`, "#3498db");
+        }
+    }
+
+    // ============================================================
+    // 7. MORTGAGE SYSTEM (UI-based: click tile → click Mortgage button)
+    // ============================================================
+
+    // Find all board tile DOM elements for properties we own that aren't mortgaged
+    function findOwnedUnmortgagedTiles() {
+        const tiles = [];
+        const seen = new Set();
+        const allEls = document.querySelectorAll('div, span');
+
+        for (const el of allEls) {
+            if (el.offsetWidth === 0 || el.offsetHeight === 0) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 200 || rect.height > 200 || rect.width < 20 || rect.height < 20) continue;
+
+            const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            if (!fiberKey) continue;
+
+            let fiber = el[fiberKey];
+            let depth = 0;
+            while (fiber && depth < 12) {
+                const block = fiber.memoizedProps?.block;
+                if (block && block.ownerId === state.pid && !block.isMortgaged && block.price && !seen.has(block.name)) {
+                    seen.add(block.name);
+                    tiles.push({ el, name: block.name, price: block.price });
+                    break;
+                }
+                fiber = fiber.return;
+                depth++;
+            }
+        }
+        return tiles;
+    }
+
+    // Find the "Mortgage for $XX" button in the currently open tippy popup
+    function findMortgageButton() {
+        const buttons = document.querySelectorAll('button');
+        for (const btn of buttons) {
+            if (btn.offsetWidth === 0) continue;
+            if (btn.closest('#mag-v17') || btn.closest('#mag-props-panel')) continue;
+            const text = (btn.innerText || '').trim();
+            if (/^Mortgage/i.test(text)) {
+                return btn;
+            }
+        }
+        return null;
+    }
+
+    // Close any open tippy popup by clicking the board center
+    function closeTippyPopup() {
+        // Click somewhere neutral to dismiss the popup
+        const center = document.elementFromPoint(300, 300);
+        if (center && !center.closest('.tippy-box') && !center.closest('#mag-v17') && !center.closest('#mag-props-panel')) {
+            center.click();
+        } else {
+            document.body.click();
+        }
+    }
+
+    // Mortgage one property via UI: click tile → wait → click Mortgage button → wait → close
+    function mortgageOneViaUI(tileInfo, callback) {
+        if (!state.isMyTurn) { callback(); return; }
+
+        // Step 1: Click the tile to open property popup
+        addLog(`Clicking tile: ${tileInfo.name}`, "#f39c12");
+        try {
+            tileInfo.el.click(); // Real DOM click to trigger tippy
+        } catch (e) {
+            addLog(`Tile click failed: ${e.message}`, "#ff4757");
+            callback();
+            return;
+        }
+
+        // Step 2: Wait for popup, find and click mortgage button
+        setTimeout(() => {
+            const btn = findMortgageButton();
+            if (btn) {
+                addLog(`MORTGAGE: ${tileInfo.name} +$${Math.floor((tileInfo.price || 0) / 2)}`, "#2ecc71");
+                reactClick(btn);
+                state.stats.mortgaged++;
+                // Mark as mortgaged locally to prevent double-counting in lobbyNet
+                const bIdx = state.blocks.findIndex(b => b.name === tileInfo.name && b.ownerId === state.pid);
+                if (bIdx >= 0) state.blocks[bIdx].isMortgaged = true;
+
+                // Step 3: Wait for mortgage to process, then close popup
+                setTimeout(() => {
+                    closeTippyPopup();
+                    setTimeout(callback, 500);
+                }, 800);
+            } else {
+                addLog(`No mortgage btn for ${tileInfo.name}`, "#ff4757");
+                closeTippyPopup();
+                setTimeout(callback, 500);
+            }
+        }, 1200);
+    }
+
+    // Mortgage all owned unmortgaged properties via UI clicks, then call onDone
+    function mortgageAllOnTurn(onDone) {
+        if (!state.ws || !state.pid || !state.isMyTurn) {
+            if (onDone) onDone();
+            return;
+        }
+
+        const tiles = findOwnedUnmortgagedTiles();
+        if (tiles.length === 0) {
+            if (onDone) onDone();
+            return;
+        }
+
+        addLog(`Mortgaging ${tiles.length} properties via UI...`, "#f39c12");
+        let idx = 0;
+
+        function next() {
+            if (idx >= tiles.length || !state.isMyTurn) {
+                if (onDone) onDone();
+                return;
+            }
+            mortgageOneViaUI(tiles[idx], () => {
+                idx++;
+                next();
+            });
+        }
+        next();
+    }
+
+    // Emergency mortgage when in debt (single cheapest property via UI)
+    function tryMortgage() {
+        if (!state.ws || !state.pid || !state.isMyTurn) return;
+        const tiles = findOwnedUnmortgagedTiles().sort((a, b) => (a.price || 0) - (b.price || 0));
+        if (tiles.length === 0) {
+            addLog("No properties to mortgage!", "#ff4757");
+            return;
+        }
+        mortgageOneViaUI(tiles[0], () => {});
+    }
+
+    // ============================================================
+    // 8. SELL PRICE CALCULATOR (reference for manual trading)
+    // ============================================================
+    function getSellPrice(blockIndex) {
+        const block = state.blocks[blockIndex];
+        if (!block || !block.price) return 0;
+        const mult = CONFIG.highSets.includes(block.countryId) ? CONFIG.highMultiplier : CONFIG.stdMultiplier;
+        const baseMarkup = block.price * mult;
+        const lobbyTax = state.lobbyNet * CONFIG.tax;
+        return Math.floor(baseMarkup + lobbyTax);
+    }
+
+    // Console command: window.MAGNATE_PRICES() to see all sell prices
+    window.MAGNATE_PRICES = () => {
+        console.log("%c SELL PRICE REFERENCE ", "background: #2ecc71; color: #fff; font-size: 14px; padding: 4px;");
+        state.blocks.forEach((b, i) => {
+            if (b.ownerId === state.pid && b.type === 'city') {
+                const price = getSellPrice(i);
+                const mult = CONFIG.highSets.includes(b.countryId) ? CONFIG.highMultiplier : CONFIG.stdMultiplier;
+                console.log(`  ${b.name} (#${i}) [${b.countryId}] - Base: $${b.price} x${mult} + ${CONFIG.tax*100}% lobby = $${price}`);
+            }
+        });
+        console.log(`  Lobby net worth: $${state.lobbyNet}`);
+    };
+
+    // ============================================================
+    // 9. SAFE BUTTON CLICKER (TRADE-AWARE)
+    // ============================================================
+
+    // NEVER EVER click these - they could accept/confirm trades
+    const BLOCKED_TEXTS = ['accept', 'confirm', 'counter', 'negotiate', 'agree', 'deal'];
+
+    // Safe game action buttons (always clickable)
+    // NOTE: "OK" removed - too risky inside trade confirmation dialogs
+    const SAFE_PATTERNS = [
+        /^Buy$/i, /^Buy for/i, /^Pass$/i, /^Skip$/i,
+        /^Got it$/i, /^Pay/i, /^Close$/i
+    ];
+    // These only get clicked when it's our turn (safer than SAFE_PATTERNS - requires isMyTurn + mortgagingDone)
+    const MY_TURN_PATTERNS = [
+        /^End turn$/i, /^Done$/i, /^Continue$/i, /^Next$/i, /^OK$/i
+    ];
+
+    // Check if an element is inside a trade/offer popup
+    function isInsideTradeUI(el) {
+        let node = el;
+        let depth = 0;
+        while (node && depth < 15) {
+            const text = (node.innerText || '').toLowerCase();
+            // Trade popups typically contain: "trade", "offer", "their offer", "your offer"
+            if (text.includes('trade offer') || text.includes('their offer') ||
+                text.includes('your offer') || text.includes('wants to trade')) {
+                return true;
+            }
+            // Also check for class names related to trade
+            const cls = (node.className || '').toLowerCase();
+            if (cls.includes('trade') || cls.includes('offer-modal') || cls.includes('negotiat')) {
+                return true;
+            }
+            node = node.parentElement;
+            depth++;
+        }
+        return false;
+    }
+
+    // Check if ANY trade popup is currently open on the page
+    function isTradePopupOpen() {
+        // Look for modal/overlay elements containing trade content
+        const modals = document.querySelectorAll('[class*="modal"], [class*="overlay"], [class*="popup"], [role="dialog"]');
+        for (const modal of modals) {
+            if (modal.offsetWidth === 0) continue;
+            const text = (modal.innerText || '').toLowerCase();
+            if (text.includes('trade') || text.includes('offer') || text.includes('wants to')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function clickSafeButtons() {
+        // SAFETY: If a trade popup is open, DO NOT click any buttons
+        if (isTradePopupOpen()) {
+            addLog("Trade popup detected - skipping clicks", "#ff4757");
+            return false;
+        }
+
+        const buttons = document.querySelectorAll('button, [role="button"]');
+        for (const btn of buttons) {
+            // Skip invisible/disabled buttons
+            if (btn.offsetWidth === 0 || btn.offsetHeight === 0) continue;
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+            // Skip our own dashboard buttons
+            if (btn.closest('#mag-v17') || btn.closest('#mag-props-panel')) continue;
+
+            const text = (btn.innerText || '').trim();
+            const textLower = text.toLowerCase();
+
+            // HARD BLOCK: Never click anything that could accept a trade
+            if (BLOCKED_TEXTS.some(blocked => textLower.includes(blocked))) continue;
+
+            // SAFETY: Skip if this button is inside a trade UI
+            if (isInsideTradeUI(btn)) continue;
+
+            // Check against safe patterns (always clickable)
+            for (const pat of SAFE_PATTERNS) {
+                if (pat.test(text)) {
+                    addLog(`UI-CLICK: ${text}`, "#f39c12");
+                    reactClick(btn);
+                    return true;
+                }
+            }
+            // Check turn-specific patterns (only when it's our turn + auto-end-turn enabled + not mortgaging)
+            if (state.isMyTurn && isAutoEndTurn() && state.mortgagingDone) {
+                for (const pat of MY_TURN_PATTERNS) {
+                    if (pat.test(text)) {
+                        addLog(`UI-CLICK: ${text}`, "#f39c12");
+                        reactClick(btn);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // ============================================================
+    // 10. REACT FIBER CLICK (for UI buttons)
+    // ============================================================
+    function reactClick(el) {
+        const fakeEvent = { preventDefault(){}, stopPropagation(){}, target: el, currentTarget: el, nativeEvent: {} };
+
+        // Try __reactProps$ first
+        const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+        if (propsKey && el[propsKey] && typeof el[propsKey].onClick === 'function') {
+            el[propsKey].onClick(fakeEvent);
+            return true;
+        }
+        // Try __reactFiber$ and walk up
+        const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        if (fiberKey) {
+            let fiber = el[fiberKey];
+            let depth = 0;
+            while (fiber && depth < 20) {
+                if (fiber.memoizedProps) {
+                    if (typeof fiber.memoizedProps.onClick === 'function') {
+                        fiber.memoizedProps.onClick(fakeEvent);
+                        return true;
+                    }
+                    if (typeof fiber.memoizedProps.onPointerUp === 'function') {
+                        fiber.memoizedProps.onPointerUp(fakeEvent);
+                        return true;
+                    }
+                }
+                fiber = fiber.return;
+                depth++;
+            }
+        }
+        // Last resort: native click
+        el.click();
+        return true;
+    }
+
+    // ============================================================
+    // 11. IDENTITY SCANNER
+    // ============================================================
+    function scanForIdentity(obj) {
+        if (state.pid || !obj || typeof obj !== 'object') return;
+
+        // Method 1: Match by CONFIG.targetName
+        const scan = (o) => {
+            if (o && typeof o === 'object') {
+                if (o.name && typeof o.name === 'string' &&
+                    o.name.toLowerCase().includes(CONFIG.targetName.toLowerCase()) && o.id) {
+                    lockIdentity(o);
+                    return;
+                }
+                Object.values(o).forEach(v => { if (v && typeof v === 'object') scan(v); });
+            }
+        };
+        scan(obj);
+
+        // Method 2: If we have participants list, find the only non-bot human
+        if (!state.pid && obj.gameState?.participants) {
+            const humans = obj.gameState.participants.filter(p => !p.isBot);
+            if (humans.length === 1) {
+                lockIdentity(humans[0]);
+            }
+        }
+        if (!state.pid && obj.participantsOrder) {
+            const humans = obj.participantsOrder.filter(p => !p.isBot);
+            if (humans.length === 1) {
+                lockIdentity(humans[0]);
+            }
+        }
+    }
+
+    function lockIdentity(player) {
+        if (state.pid) return;
+        state.pid = player.id;
+        state.myMoney = (typeof player.money === 'number') ? player.money : 1500;
+        state.myPosition = player.position || 0;
+        updateMeUI(player.name);
+        addLog(`Identity: ${player.name} (${state.pid.slice(0,8)})`, "#2ecc71");
+        updateStatsUI();
+    }
+
+    // ============================================================
+    // 11b. LOBBY NET WORTH CALCULATOR (V18.1 FIX)
+    // ============================================================
+    // Extracted into its own function so it can be called immediately
+    // when a player leaves (not just every 5s in the main loop).
+    // FIX: Only counts properties whose ownerId is a CURRENT player in state.players.
+    // When a player leaves/goes bankrupt, their entry is deleted from state.players
+    // and their properties' ownerId is cleared — so their cash AND property value
+    // both drop out of the total immediately.
+    function recalcLobbyNet() {
+        let total = 0;
+        const activePlayerIds = new Set(Object.keys(state.players));
+
+        // Sum all active player cash (including negative = debt)
+        Object.values(state.players).forEach(p => {
+            const money = p.money;
+            if (typeof money === 'number' && !isNaN(money)) total += money;
+        });
+
+        // Sum property values — only for properties owned by active players
+        state.blocks.forEach(b => {
+            if (!b.ownerId || !b.price) return;
+            // V18.1 FIX: Skip properties owned by players no longer in the game
+            if (!activePlayerIds.has(b.ownerId)) return;
+            // Mortgaged properties: the cash was already received (counted in player money)
+            // so don't double-count. Only add unmortgaged property mortgage value.
+            if (!b.isMortgaged) {
+                total += Math.floor(b.price / 2);
+            }
+            // House/hotel improvements add value (half of what was spent)
+            if (b.level && b.level > 0 && !b.isMortgaged) {
+                if (b.level <= 4) {
+                    total += Math.floor((b.level * (b.housePrice || 0)) / 2);
+                } else if (b.level === 5) {
+                    total += Math.floor((4 * (b.housePrice || 0) + (b.hotelPrice || 0)) / 2);
+                }
+            }
+        });
+
+        state.lobbyNet = total;
+
+        // Update lobby net worth & 16% tax on dashboard
+        const taxAmount = Math.floor(state.lobbyNet * CONFIG.tax);
+        const netEl = document.getElementById('mag-net');
+        const taxEl = document.getElementById('mag-tax');
+        if (netEl) netEl.innerText = state.lobbyNet;
+        if (taxEl) taxEl.innerText = taxAmount;
+
+        // Price & inflation snapshots now recorded per game turn (see handleTurnEnded)
+    }
+
+    // ============================================================
+    // 12. MAIN LOOP (backup actions + negotiations + net worth)
+    // ============================================================
+    window.__magnateMainLoop = setInterval(() => {
+        if (!state.enabled) return;
+
+        // Backup: if it's our turn and we haven't rolled yet, try again
+        if (state.isMyTurn && !state.diceRolled && state.ws) {
+            wsSend("plz-roll-dices");
+        }
+
+        // If it's our turn and dice already rolled, try purchase + click safe buttons
+        if (state.isMyTurn && state.diceRolled) {
+            if (!state.purchaseSent) {
+                state.purchaseSent = true;
+                wsSend("purchase-property");
+            }
+            clickSafeButtons();
+        }
+
+        // Periodic DOM scan: detect if it's our turn even without WS event
+        if (!state.isMyTurn && state.ws) {
+            syncStateFromDOM();
+        }
+
+        // Click safe buttons (handles popups, bonus cards, Pay rent, etc.)
+        // Only when no trade popup is open
+        clickSafeButtons();
+
+        // V18.1: Lobby net worth recalculation (extracted to function for reuse)
+        recalcLobbyNet();
+
+        // Scan blocks for new negotiation targets (catches purchases we missed)
+        scanForNegotiationTargets();
+
+        // Run auto-buy trade negotiations
+        runNegotiations();
+
+    }, 5000);
+
+    // ============================================================
+    // 13. UI CONTROLS
+    // ============================================================
+    document.getElementById('mag-link').onclick = () => {
+        addLog("CLICK YOUR NAME IN PLAYER LIST...", "#f39c12");
+        document.body.style.cursor = "crosshair";
+        const handler = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            document.body.style.cursor = "default";
+            window.removeEventListener('mousedown', handler, true);
+            const text = e.target.innerText || "";
+            Object.values(state.players).forEach(p => {
+                if (text.includes(p.name) || p.name.includes(text)) {
+                    state.pid = p.id;
+                    state.myPosition = p.position || 0;
+                    state.myMoney = p.money || 0;
+                    addLog("IDENTITY LOCKED: " + p.name, "#2ecc71");
+                    updateMeUI(p.name);
+                    updateStatsUI();
+                }
+            });
+        };
+        window.addEventListener('mousedown', handler, true);
+    };
+
+    document.getElementById('mag-force').onclick = () => {
+        addLog("FORCE ROLL VIA WS...", "#f39c12");
+        wsSend("plz-roll-dices");
+    };
+
+    document.getElementById('mag-onoff').onclick = () => {
+        state.enabled = !state.enabled;
+        document.getElementById('mag-onoff').innerText = state.enabled ? 'BOT: ACTIVE' : 'BOT: PAUSED';
+        document.getElementById('mag-onoff').style.background = state.enabled ? '#2ecc71' : '#555';
+        addLog(state.enabled ? "Bot ENABLED" : "Bot PAUSED", state.enabled ? "#2ecc71" : "#ff4757");
+    };
+
+    document.getElementById('mag-min').onclick = (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const c = document.getElementById('mag-content');
+        const isMin = c.style.display === 'none';
+        c.style.display = isMin ? '' : 'none';
+        document.getElementById('mag-min').innerText = isMin ? 'MIN' : 'MAX';
+        ui.style.width = isMin ? '290px' : '160px';
+    };
+
+    // --- Properties Panel Controls ---
+    document.getElementById('mag-props-btn').onclick = (e) => {
+        e.stopPropagation();
+        const panel = document.getElementById('mag-props-panel');
+        if (panel.style.display === 'none') {
+            buildPropertiesList();
+            panel.style.display = '';
+        } else {
+            panel.style.display = 'none';
+        }
+    };
+
+    document.getElementById('mag-props-close').onclick = (e) => {
+        e.stopPropagation();
+        document.getElementById('mag-props-panel').style.display = 'none';
+    };
+
+    // --- Charts Panel Controls (V18.2) ---
+    let _chartRefreshTimer = null;
+    document.getElementById('mag-charts-btn').onclick = (e) => {
+        e.stopPropagation();
+        const panel = document.getElementById('mag-charts-panel');
+        if (panel.style.display === 'none') {
+            panel.style.display = '';
+            renderCharts();
+            // Auto-refresh chart every 10s while panel is open
+            if (_chartRefreshTimer) clearInterval(_chartRefreshTimer);
+            _chartRefreshTimer = setInterval(() => {
+                if (document.getElementById('mag-charts-panel').style.display !== 'none') {
+                    renderCharts();
+                } else {
+                    clearInterval(_chartRefreshTimer);
+                    _chartRefreshTimer = null;
+                }
+            }, 10000);
+        } else {
+            panel.style.display = 'none';
+            if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
+        }
+    };
+
+    document.getElementById('mag-charts-close').onclick = (e) => {
+        e.stopPropagation();
+        document.getElementById('mag-charts-panel').style.display = 'none';
+        if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
+    };
+
+    // --- Inflation Tracker Panel Controls (V18.3) ---
+    let _inflationRefreshTimer = null;
+    document.getElementById('mag-inflation-btn').onclick = (e) => {
+        e.stopPropagation();
+        const panel = document.getElementById('mag-inflation-panel');
+        if (panel.style.display === 'none') {
+            panel.style.display = '';
+            renderInflationChart();
+            // Auto-refresh while panel is open
+            if (_inflationRefreshTimer) clearInterval(_inflationRefreshTimer);
+            _inflationRefreshTimer = setInterval(() => {
+                if (document.getElementById('mag-inflation-panel').style.display !== 'none') {
+                    renderInflationChart();
+                } else {
+                    clearInterval(_inflationRefreshTimer);
+                    _inflationRefreshTimer = null;
+                }
+            }, 10000);
+        } else {
+            panel.style.display = 'none';
+            if (_inflationRefreshTimer) { clearInterval(_inflationRefreshTimer); _inflationRefreshTimer = null; }
+        }
+    };
+
+    document.getElementById('mag-inflation-close').onclick = (e) => {
+        e.stopPropagation();
+        document.getElementById('mag-inflation-panel').style.display = 'none';
+        if (_inflationRefreshTimer) { clearInterval(_inflationRefreshTimer); _inflationRefreshTimer = null; }
+    };
+
+    // Inflation filter buttons
+    document.querySelectorAll('.mag-inf-filter').forEach(btn => {
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            const turns = parseInt(btn.dataset.turns);
+            state.inflationFilterTurns = turns;
+            // Update button styles
+            document.querySelectorAll('.mag-inf-filter').forEach(b => {
+                b.style.background = '#34495e';
+            });
+            btn.style.background = '#e67e22';
+            // Re-render chart with new filter
+            renderInflationChart();
+        };
+    });
+
+    document.getElementById('mag-props-copyall').onclick = (e) => {
+        e.stopPropagation();
+        const owned = [];
+        state.blocks.forEach((b, idx) => {
+            if (b.ownerId === state.pid && b.type === 'city') {
+                const mult = CONFIG.highSets.includes(b.countryId) ? CONFIG.highMultiplier : CONFIG.stdMultiplier;
+                const baseMarkup = b.price * mult;
+                const lobbyTax = Math.floor(state.lobbyNet * CONFIG.tax);
+                const sellPrice = Math.floor(baseMarkup + lobbyTax);
+                owned.push({ name: b.name, country: b.countryId, sellPrice });
+            }
+        });
+        if (owned.length === 0) {
+            addLog("No properties to copy!", "#ff4757");
+            return;
+        }
+        const lines = owned.map(p => `${p.name} (${p.country}) - $${p.sellPrice}`);
+        const lobbyTax = Math.floor(state.lobbyNet * CONFIG.tax);
+        const text = `My Properties For Sale:\n${lines.join('\n')}\n(Prices include ${CONFIG.tax*100}% lobby tax of $${lobbyTax})`;
+        copyToClipboard(text);
+        const btn = document.getElementById('mag-props-copyall');
+        btn.innerText = 'ALL COPIED!';
+        btn.style.background = '#2ecc71';
+        setTimeout(() => { btn.innerText = 'COPY ALL PRICES'; btn.style.background = '#8e44ad'; }, 2000);
+        addLog(`Copied ${owned.length} property prices!`, "#1abc9c");
+    };
+
+    document.getElementById('mag-prices').onclick = (e) => {
+        e.stopPropagation();
+        const tax = Math.floor(state.lobbyNet * CONFIG.tax);
+        const msg = `My prices: Brazil, Israel & Italy = 9x original cost. All other sets = 5x original cost. 16% of the lobby's net worth is taxed onto each sale (currently $${tax}).`;
+        navigator.clipboard.writeText(msg).then(() => {
+            addLog("Sell prices copied!", "#8e44ad");
+            const btn = document.getElementById('mag-prices');
+            btn.innerText = 'COPIED!';
+            setTimeout(() => { btn.innerText = 'COPY SELL PRICES'; }, 2000);
+        }).catch(() => {
+            // Fallback for clipboard API failure
+            const ta = document.createElement('textarea');
+            ta.value = msg;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            addLog("Sell prices copied!", "#8e44ad");
+            const btn = document.getElementById('mag-prices');
+            btn.innerText = 'COPIED!';
+            setTimeout(() => { btn.innerText = 'COPY SELL PRICES'; }, 2000);
+        });
+    };
+
+    addLog("V18.3 INFLATION TRACKER ready. Inject anytime - it just works.", "#2ecc71");
+    addLog("NEW: INFLATION TRACKER - lobby net worth chart with % change & turn filters.", "#e67e22");
+    addLog("NEW: All charts now turn-based (1 turn = all players go once).", "#9b59b6");
+    addLog("FIX: Net worth uses half property value, $0 for mortgaged.", "#27ae60");
+    addLog("6 WS detection methods active. Auto-reconnect enabled.", "#f1c40f");
+})();

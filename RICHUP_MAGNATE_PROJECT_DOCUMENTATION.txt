@@ -1,0 +1,866 @@
+================================================================================
+    RICHUP MAGNATE CONSOLE BOT -- PROJECT DOCUMENTATION & TECHNICAL DEEP-DIVE
+================================================================================
+
+Author:       seeds3
+Project Type: Browser-Injected Game Analytics Bot + Full-Stack Live Dashboard
+Stack:        Vanilla JavaScript (client injection), Node.js + Express + WebSocket (server)
+Codebase:     ~2,500 lines (injection script) + ~650 lines (server + frontend)
+Versions:     V18.2 through V18.5, iterated across a single intensive session
+Deployment:   GitHub -> Render auto-deploy (CI/CD)
+
+
+================================================================================
+SECTION 1: EXECUTIVE SUMMARY
+================================================================================
+
+I designed and built "Richup Magnate," a sophisticated real-time game analytics
+bot for Richup -- an online multiplayer Monopoly-style browser game. The system
+operates as a JavaScript injection pasted into the browser console during live
+gameplay. It intercepts all game communication at the WebSocket layer, maintains
+a parallel model of the complete game state, and exposes a floating GUI dashboard
+with real-time analytics, automated gameplay actions, and financial charting.
+
+The project evolved across four version increments (V18.2 through V18.5) in a
+single development session, culminating in a full-stack deployment: the client-
+side injection script feeds data to a Node.js server on Render, which broadcasts
+live charts to external viewers via WebSocket.
+
+This document serves two purposes:
+  (1) A portfolio piece demonstrating the breadth and depth of skills applied.
+  (2) A technical reference for senior engineers who want to understand the
+      architecture, trade-offs, and implementation details.
+
+
+================================================================================
+SECTION 2: SKILLS DEMONSTRATED
+================================================================================
+
+  - WebSocket Protocol Reverse Engineering
+    Intercepted and decoded Socket.IO-framed messages without documentation.
+    Built a full event-driven protocol handler mapping 20+ game events to
+    state mutations.
+
+  - React Internals (Fiber Tree Traversal)
+    Crawled __reactFiber$ and __reactInternalInstance$ keys to extract
+    memoizedProps and memoizedState from the host application's component tree.
+    Used this for state recovery when the script is injected mid-game and for
+    triggering React-bound onClick/onPointerUp handlers on DOM elements.
+
+  - Real-Time Data Visualization (Canvas 2D)
+    Built two independent charting systems (property price history and lobby
+    inflation) rendered on HTML5 <canvas> with custom axes, gridlines, legends,
+    area fills, end-point labels, and adaptive scaling -- all without any
+    charting library.
+
+  - Financial / Economic Modeling
+    Designed a net worth calculation honoring Monopoly economics: half purchase
+    price for unmortgaged properties, zero for mortgaged, half-cost for houses
+    and hotels (including the 4-house prerequisite for hotels). Devised an
+    inflation index with a bankruptcy offset system (detailed in Section 6).
+
+  - Browser Extension / Injection Development
+    Created a fully self-contained IIFE (Immediately Invoked Function
+    Expression) safe for re-paste. The script cleans up its own intervals,
+    event listeners, and DOM nodes on re-injection. Six independent WebSocket
+    detection methods ensure attachment regardless of injection timing.
+
+  - Full-Stack Development
+    Node.js + Express server with dual WebSocket roles (bot ingress, viewer
+    broadcast). Static frontend served with professional dark-themed UI,
+    tabbed navigation, auto-reconnect, and the same charting engine as the
+    injection script.
+
+  - DevOps / CI-CD
+    GitHub repository connected to Render for automatic deployment on push.
+    GitHub CLI used for repository management. Playwright persistent browser
+    context used for Render dashboard access.
+
+  - Systematic Debugging & Code Auditing
+    Conducted a thorough audit of net worth calculation when a user-reported
+    $1,000 inflation spike appeared unexplainable. Traced every possible
+    source of money entering and leaving the economy, ultimately proving the
+    spike was natural (Go salary + Chance cards across two player turns).
+
+  - Architecture Decision-Making
+    Evaluated three competing approaches to bankruptcy handling in the
+    inflation tracker (full divisor, raw total, cash-offset hybrid). Selected
+    the approach that best modeled the specific game's economics and
+    documented the reasoning (see Section 6).
+
+
+================================================================================
+SECTION 3: SYSTEM ARCHITECTURE OVERVIEW
+================================================================================
+
+The system has three layers:
+
+  Layer 1: Client-Side Injection Script (V18.5, ~2,500 lines)
+  +-----------------------------------------------------------------+
+  |  Browser Console (pasted into Richup game tab)                  |
+  |                                                                 |
+  |  +-- WebSocket Interception Engine (6 detection methods) -----+ |
+  |  |   Captures game WS, proxies all inbound/outbound messages  | |
+  |  +------------------------------------------------------------+ |
+  |                                                                 |
+  |  +-- Event-Driven Protocol Handler ("The Brain") -------------+ |
+  |  |   Parses Socket.IO frames, dispatches to 20+ event cases   | |
+  |  +------------------------------------------------------------+ |
+  |                                                                 |
+  |  +-- Parallel Game State Model -------------------------------+ |
+  |  |   players{}, blocks[], participantsOrder[], gameTurn, etc.  | |
+  |  +------------------------------------------------------------+ |
+  |                                                                 |
+  |  +-- Automation Subsystems --+  +-- Analytics Subsystems -----+ |
+  |  |   Auto-roll dice          |  |   Net worth calculator      | |
+  |  |   Auto-buy properties     |  |   Sell price calculator     | |
+  |  |   Auto-mortgage (UI)      |  |   Price history recorder    | |
+  |  |   Auto-decline trades     |  |   Inflation tracker         | |
+  |  |   Auto-buy trade offers   |  |   Canvas chart renderer     | |
+  |  +---------------------------+  +-----------------------------+ |
+  |                                                                 |
+  |  +-- Floating GUI Dashboard (DOM-injected) -------------------+ |
+  |  |   Status bar, toggle checkboxes, event log, overlay panels | |
+  |  +------------------------------------------------------------+ |
+  |                                                                 |
+  |  +-- Live Tracker Client (V18.5) ---+                          |
+  |  |   Sends snapshots to Render via   |                          |
+  |  |   separate WS (_OriginalWS)       |                          |
+  |  +----------------------------------+                          |
+  +-----------------------------------------------------------------+
+
+  Layer 2: Relay Server (Node.js + Express + ws library)
+  +-----------------------------------------------------------------+
+  |  richup-live-tracker/server.js                                  |
+  |                                                                 |
+  |  HTTP server (Express, serves static frontend)                  |
+  |  WebSocket server (ws library):                                 |
+  |    /bot   -- single connection from the injection script         |
+  |    /view  -- N connections from external viewers                 |
+  |                                                                 |
+  |  In-memory game state:                                          |
+  |    inflationHistory[]    -- [{turn, netWorth}]                   |
+  |    priceHistory{}        -- {blockIndex: [{turn, p}]}            |
+  |    propertyNames{}       -- {blockIndex: {name, countryId}}      |
+  |    gameTurn, lobbyNet, playerCount, lastUpdate                   |
+  |                                                                 |
+  |  Message types handled:                                         |
+  |    reset      -- new game, clear all data, broadcast to viewers  |
+  |    snapshot   -- turn-end data, append + broadcast               |
+  |    bankruptcy -- immediate inflation update + broadcast           |
+  |                                                                 |
+  |  Viewer connection: receives fullState on connect, incremental   |
+  |  updates thereafter.                                            |
+  +-----------------------------------------------------------------+
+
+  Layer 3: Live Viewer Frontend (public/index.html)
+  +-----------------------------------------------------------------+
+  |  Professional dark-themed single-page application                |
+  |  Two tabs: "Inflation Tracker" and "Property Values"             |
+  |  Stat cards: current net worth, $ change, % change               |
+  |  Filter buttons: ALL / 5 / 10 / 20 / 50 / 100 turns             |
+  |  Canvas charts matching the injection script's visual style      |
+  |  Auto-reconnect on WebSocket disconnect (3-second retry)         |
+  |  Connection status indicator (red/green dot)                     |
+  +-----------------------------------------------------------------+
+
+
+================================================================================
+SECTION 4: WEBSOCKET INTERCEPTION ENGINE (6 METHODS)
+================================================================================
+
+The injection script can be pasted at any point -- before the game page loads,
+in the lobby, or mid-game. To guarantee WebSocket attachment regardless of
+timing, six independent detection methods operate concurrently:
+
+METHOD 1: WebSocket Constructor Proxy
+--------------------------------------
+The native window.WebSocket constructor is replaced with a wrapper function.
+All future WebSocket instantiations pass through this proxy. When the URL
+matches game patterns (/socket.io/, /api/, richup), the proxy waits for the
+'open' event and then attaches the bot's message handler.
+
+    const _OriginalWS = window.WebSocket;
+    window.WebSocket = function(...args) {
+        const ws = new _OriginalWS(...args);
+        // ... attach on open if URL matches game patterns ...
+        return ws;
+    };
+    window.WebSocket.prototype = _OriginalWS.prototype;
+
+The original constructor is preserved as _OriginalWS and reused for the bot's
+own outbound connections (to the live tracker server), ensuring it does not
+accidentally intercept itself.
+
+METHOD 2: Send Hook
+--------------------
+The prototype send() method on the original WebSocket is patched. Any time
+any WebSocket sends data, if the bot does not yet have an attached connection,
+it checks whether the sender is a live game socket and attaches.
+
+    _OriginalWS.prototype.send = function(data) {
+        if (!state.ws || state.ws.readyState !== 1) {
+            if (this.readyState === 1) {
+                attachToWS(this, 'send-hook');
+            }
+        }
+        return _OriginalSend.apply(this, arguments);
+    };
+
+This catches connections that were established before injection -- the first
+heartbeat pong triggers attachment.
+
+METHOD 3: Immediate Existing Connection Check
+----------------------------------------------
+On injection, if window.activeWS already references a live WebSocket, the bot
+attaches immediately. This handles the case where a previous script version
+stored the connection globally.
+
+METHOD 4: Adaptive Deep Property Scanner
+------------------------------------------
+A repeating interval scans for WebSocket instances across the entire window
+object graph, up to four levels deep. This handles Socket.IO's nested
+structure (io.managers[url].engine.transport.ws). The scan rate adapts:
+
+    Attempts 1-20:   500ms interval  (aggressive, first 10 seconds)
+    Attempts 21-50:  2000ms interval (moderate, next 60 seconds)
+    Attempts 51+:    5000ms interval (background, indefinitely)
+
+The scan also checks known global variable names: activeWS, _ws, socket, ws,
+gameSocket, io.
+
+METHOD 5: MutationObserver
+---------------------------
+A DOM MutationObserver watches for structural changes to document.body. Each
+mutation triggers a WebSocket scan (if not yet attached) or an identity
+recovery attempt (if attached but player ID unknown). The observer self-
+disconnects after 2 minutes to avoid performance overhead.
+
+METHOD 6: Page Visibility Handler
+-----------------------------------
+A visibilitychange listener re-scans for WebSocket connections when the user
+returns to the tab. If no connection is found, it restarts the full adaptive
+scanner. This handles cases where the connection was lost while the tab was
+in the background.
+
+
+================================================================================
+SECTION 5: REACT FIBER TREE CRAWLING
+================================================================================
+
+Richup is built on React. When the injection script is pasted mid-game, it
+needs to recover the current game state (board layout, player data) that
+would normally arrive only in the initial "entered-room" WebSocket message.
+
+The script locates the React root DOM node, finds the __reactFiber$ key, and
+walks the fiber tree up to 50 nodes deep, checking memoizedState and
+memoizedProps at each fiber for arrays that look like board blocks (have
+properties like 'price', 'countryId', 'ownerId'):
+
+    const fiberKey = Object.keys(appRoot).find(k =>
+        k.startsWith('__reactFiber$') ||
+        k.startsWith('__reactInternalInstance$'));
+    let fiber = appRoot[fiberKey];
+    while (fiber && depth < 50) {
+        const s = fiber.memoizedState;
+        const p = fiber.memoizedProps;
+        if (Array.isArray(s) && s.length > 20 && s[0]?.price !== undefined) {
+            state.blocks = s;
+        }
+        fiber = fiber.child || fiber.sibling || fiber.return;
+    }
+
+This technique is also used to:
+  - Recover player identity by matching CONFIG.targetName against on-screen
+    text elements, then walking their fiber tree upward to find player data.
+  - Trigger React event handlers (onClick, onPointerUp) on DOM elements
+    that do not respond to native DOM click events, by invoking the
+    memoizedProps handler directly with a synthetic event object.
+  - Find mortgage buttons inside property detail popups by traversing the
+    fiber tree from the popup DOM node.
+
+
+================================================================================
+SECTION 6: INFLATION TRACKING & BANKRUPTCY HANDLING (CORE DESIGN DECISION)
+================================================================================
+
+6.1 THE PROBLEM
+----------------
+The Inflation Tracker shows total lobby net worth over game turns. When a
+player goes bankrupt, two things happen simultaneously:
+
+  (A) Their cash disappears from the economy.
+  (B) Their properties return to the bank (unowned).
+
+Naively subtracting both causes an ugly, misleading dip in the chart. But
+ignoring both (like an S&P 500 index divisor) hides real economic events.
+The question: which part of the drop is "artificial" (just an accounting
+artifact of a player leaving) and which is "real deflation" (actual value
+leaving the game economy)?
+
+6.2 THREE APPROACHES EVALUATED
+--------------------------------
+
+APPROACH 1: Full Divisor Method (S&P 500 Style)
+  Idea: Compute a divisor that absorbs the entire net worth change at
+  bankruptcy, so the chart shows zero discontinuity.
+
+  Rejected because: In Richup, there are NO auctions when a player goes
+  bankrupt to the bank. Properties genuinely return to the bank as unowned
+  tiles. Other players must land on them and buy them fresh. This means
+  property value DOES leave the economy -- it is real deflation, and hiding
+  it would produce a misleading chart.
+
+APPROACH 2: Raw Total (No Adjustment)
+  Idea: Just plot the raw sum. If it dips, it dips.
+
+  Rejected because: The bankrupt player's cash was largely already
+  redistributed to other players via rent payments before the bankruptcy
+  event fired. The cash figure at bankruptcy is typically near zero or
+  negative (debt). Removing this near-zero cash from the total barely
+  matters, but the accounting artifact of deleting the player entry can
+  still cause small artificial discontinuities. More importantly, if the
+  player had negative cash (debt), deleting them causes an artificial
+  INCREASE, which is equally misleading.
+
+APPROACH 3: Cash-Offset Hybrid (CHOSEN)
+  Idea: Separate cash from property value. Absorb the cash component (it is
+  not real deflation -- the player is gone, their cash is voided). Let the
+  property component show as a real dip (assets truly left the economy).
+
+  Implementation:
+    state.inflationOffset += playerCash;   // at bankruptcy time
+    adjustedNet = lobbyNet + inflationOffset;  // at recording time
+
+  This handles all edge cases:
+    - Positive cash (rare at bankruptcy): offset increases, chart absorbs it.
+    - Negative cash (debt at bankruptcy): offset decreases. This is correct:
+      the debt was owed to the bank, so "forgiving" it would artificially
+      bump the chart UP. The negative offset counteracts that bump.
+    - Zero cash: no offset change. Clean.
+
+6.3 IMPLEMENTATION DETAILS
+----------------------------
+
+The offset is applied at RECORDING time, not retroactively. This means
+historical data points are immutable -- they represent what the economy
+looked like at the time they were recorded. Only future snapshots include
+the accumulated offset.
+
+    function recordInflationSnapshot() {
+        const turn = state.gameTurn;
+        const adjustedNet = state.lobbyNet + state.inflationOffset;
+        const hist = state.inflationHistory;
+        if (hist.length === 0 || hist[hist.length - 1].turn !== turn) {
+            hist.push({ turn: turn, netWorth: adjustedNet });
+        } else {
+            hist[hist.length - 1].netWorth = adjustedNet;
+        }
+    }
+
+A snapshot is recorded IMMEDIATELY after bankruptcy processing (not at the
+next turn boundary) so that the property deflation appears at the correct
+point in the chart timeline.
+
+The offset resets to zero on new game start, when inflationHistory and
+priceHistory are also cleared.
+
+6.4 WHY THIS MATTERS
+----------------------
+This design mirrors real-world index construction challenges. The S&P 500
+uses a full divisor because delisted companies' shares are bought/sold in
+the market -- value doesn't vanish. But in Richup, properties DO vanish
+from the economy when their owner goes bankrupt (no auction mechanism), so
+a full divisor would be dishonest. The hybrid approach accurately models
+the specific game's economics.
+
+
+================================================================================
+SECTION 7: NET WORTH CALCULATION -- DEEP AUDIT
+================================================================================
+
+The net worth calculation was audited line-by-line to confirm correctness.
+
+RULES MODELED:
+  - Cash: counted at full face value (including negative/debt).
+  - Unmortgaged properties: half of purchase price. (In Monopoly economics,
+    you can mortgage or sell a property for half its face value.)
+  - Mortgaged properties: $0 value. (The cash was already received when
+    mortgaged and is counted in the player's cash balance.)
+  - Houses (level 1-4): half of (level * housePrice).
+  - Hotels (level 5): half of (4 * housePrice + hotelPrice). This accounts
+    for the four houses that had to be built before upgrading to a hotel.
+  - Only properties owned by ACTIVE players in state.players are counted.
+
+IMPLEMENTATION (recalcLobbyNet):
+
+    function recalcLobbyNet() {
+        let total = 0;
+        const activePlayerIds = new Set(Object.keys(state.players));
+
+        // Cash
+        Object.values(state.players).forEach(p => {
+            const money = p.money;
+            if (typeof money === 'number' && !isNaN(money)) total += money;
+        });
+
+        // Property + building values
+        state.blocks.forEach(b => {
+            if (!b.ownerId || !b.price) return;
+            if (!activePlayerIds.has(b.ownerId)) return;  // V18.1 fix
+            if (!b.isMortgaged) {
+                total += Math.floor(b.price / 2);
+            }
+            if (b.level && b.level > 0 && !b.isMortgaged) {
+                if (b.level <= 4) {
+                    total += Math.floor((b.level * (b.housePrice || 0)) / 2);
+                } else if (b.level === 5) {
+                    total += Math.floor(
+                        (4 * (b.housePrice || 0) + (b.hotelPrice || 0)) / 2
+                    );
+                }
+            }
+        });
+
+        state.lobbyNet = total;
+    }
+
+AUDIT FINDINGS:
+
+  No bugs found. A user-reported $1,000 inflation spike in a 2-player game
+  was investigated. Analysis of all possible money sources:
+
+    - Building houses DECREASES net worth: spend $400 cash, gain $200 in
+      half-value assets. Net -$200.
+    - Selling houses is net-zero: gain cash, lose asset value.
+    - Trades between players are zero-sum: total lobby net unchanged.
+    - Passing Go injects $300 of new bank money into the economy.
+    - Chance/Community Chest cards inject $50-$200 from the bank.
+    - Doubles allow extra turns, compounding money injection.
+
+  Conclusion: In a 2-player game, one complete game turn includes both
+  players taking their turns. Two Go salaries ($600) + doubles + a
+  Chance card ($200) easily accounts for the observed $1,000 spike.
+  The calculation is correct.
+
+
+================================================================================
+SECTION 8: SELL PRICE CALCULATOR
+================================================================================
+
+The sell price for any property is computed using configurable multipliers
+and a lobby-wide tax:
+
+    function getSellPrice(blockIndex) {
+        const block = state.blocks[blockIndex];
+        if (!block || !block.price) return 0;
+        const mult = CONFIG.highSets.includes(block.countryId)
+            ? CONFIG.highMultiplier   // 9x for brazil, israel, italy
+            : CONFIG.stdMultiplier;   // 5x for all others
+        const baseMarkup = block.price * mult;
+        const lobbyTax = state.lobbyNet * CONFIG.tax;  // 16% of total net worth
+        return Math.round(baseMarkup + lobbyTax);
+    }
+
+The rationale: early-game color sets (cheaper properties) have a higher
+multiplier (9x) because scarcity and strategic value make them worth more
+relative to their base price. The 16% lobby tax adds a dynamic component
+that scales sell prices with overall game inflation.
+
+This calculator serves as a pricing reference for manual trade negotiations.
+Prices are displayed in the "MY PROPERTIES" overlay panel and can be copied
+to the clipboard. Historical sell prices are recorded each game turn and
+plotted on the price charts.
+
+
+================================================================================
+SECTION 9: AUTOMATION SUBSYSTEMS
+================================================================================
+
+9.1 AUTO-ROLL DICE
+-------------------
+When the "your-turn" event fires, the script sends "plz-roll-dices" via
+WebSocket. A backup in the 5-second main loop interval re-sends if the dice
+event was missed. A "FORCE ROLL" button allows manual triggering. Double-roll
+prevention: the diceRolled flag is set on the "dices-rolled" response event,
+not on send.
+
+9.2 AUTO-BUY PROPERTIES
+-------------------------
+When landing on an unowned property, "purchase-property" is sent via WS.
+The purchaseSent flag prevents duplicate purchase attempts within the same
+turn.
+
+9.3 AUTO-MORTGAGE (UI-Based)
+------------------------------
+After buying a property, the script mortgages all unmortgaged properties to
+maximize available cash for future purchases. This cannot be done via
+WebSocket (the game server does not expose a mortgage API). Instead:
+
+  Step 1: Find owned unmortgaged tiles in the DOM using a combination of
+          CSS class matching and React fiber traversal.
+  Step 2: Simulate a click on the tile element (using fiber memoizedProps
+          onClick/onPointerUp, since native .click() is often no-op on
+          React components).
+  Step 3: Wait for the property detail popup to appear (MutationObserver
+          or setTimeout).
+  Step 4: Find the mortgage button inside the popup via DOM traversal
+          (searching for buttons with text matching /mortgage/i).
+  Step 5: Click the mortgage button.
+  Step 6: Close the popup.
+
+A mortgaging state lock (state.mortgagingDone = false) prevents the
+auto-end-turn system from ending the turn while mortgaging is in progress.
+A safety timeout releases the lock after 10 seconds in case the mortgage
+flow gets stuck.
+
+9.4 AUTO-DECLINE TRADES
+-------------------------
+Incoming trade proposals are automatically declined via WebSocket. The
+script sends a decline response for every "trade-proposed" event.
+
+9.5 AUTO-BUY TRADE OFFERS (Escalating Negotiation)
+----------------------------------------------------
+When another player buys a property from a color set the bot does not own,
+the bot initiates an escalating purchase offer sequence:
+
+    Stage 0: Offer $500
+    Stage 1: Offer $600  (after 60 seconds)
+    Stage 2: Offer $700  (after 60 seconds)
+    Stage 3: Offer $800  (after 60 seconds)
+    Cooldown: 5 minutes, then restart from $500.
+
+Negotiations are tracked per block index in state.negs. If the target player
+goes bankrupt or leaves, the negotiation is automatically cancelled.
+
+9.6 TRADE-AWARE SAFE BUTTON CLICKING
+--------------------------------------
+The bot periodically clicks "safe" buttons (OK, Pay, Continue, End Turn,
+Done) to handle popup dialogs. Critical safety logic:
+
+  - isInsideTradeUI(el): Walks the DOM tree upward from a button, checking
+    for parent elements whose class or text content indicates a trade popup.
+  - isTradePopupOpen(): Scans the page for modal/overlay/dialog elements
+    containing trade-related keywords.
+  - If any trade UI is detected, ALL automatic button clicking is suppressed.
+
+This prevents the bot from accidentally accepting a trade offer when trying
+to click a benign "OK" or "Confirm" button.
+
+
+================================================================================
+SECTION 10: CHARTING SYSTEM (Canvas 2D)
+================================================================================
+
+Two chart types are rendered on HTML5 <canvas> elements, entirely without
+external libraries.
+
+10.1 PROPERTY PRICE HISTORY CHART
+-----------------------------------
+  - Multi-series line chart with one line per owned property.
+  - Color-coded by country (brazil=#D2691E, israel=#00BFFF, italy=#FF4444,
+    germany=#FFD700, china=#00FF7F, france=#FF69B4, uk=#4DA6FF, usa=#DA70D6).
+  - Fallback color palette for properties without country mapping.
+  - Dynamic legend rendered above the chart.
+  - X-axis: game turns (T0, T1, T2, ...).
+  - Y-axis: sell price in dollars, auto-scaled with 10% padding.
+  - Grid lines, axis labels, end-point dots with price labels.
+  - Full history from game start (no cap -- previously capped at 500 entries
+    when charts were time-based in V18.2).
+
+10.2 INFLATION TRACKER CHART
+------------------------------
+  - Single-series area chart showing total lobby net worth over time.
+  - Green fill/line when trending up, red when trending down.
+  - Stat cards above the chart: current net worth, $ change, % change.
+  - Filter buttons: ALL, 5, 10, 20, 50, 100 turns. Filters constrain the
+    visible data window AND recalculate $ and % change relative to the
+    start of the filtered window. This allows spotting short-term dips
+    within an overall uptrend.
+  - End-point dot with price label.
+  - Charts auto-refresh every 10 seconds while the panel is open.
+
+10.3 TURN-BASED X-AXIS (V18.3 CHANGE)
+---------------------------------------
+Prior to V18.3, all charts used wall-clock time (elapsed minutes/seconds)
+for the x-axis. This was changed to game turns because:
+
+  - Time-based charts compress data unevenly: fast turns produce clusters,
+    slow turns produce gaps.
+  - Game events are inherently turn-based: money enters the economy per
+    turn (Go salary, Chance cards), not per second.
+  - Turn-based x-axis makes it easy to correlate chart movements with
+    specific game events.
+
+A "game turn" is defined as one complete round: all active players take
+their turn once. Detection: when currentPlayerIndex wraps to 0 (or the
+player who went first takes their turn again), state.gameTurn increments.
+
+
+================================================================================
+SECTION 11: VERSION HISTORY (THIS SESSION)
+================================================================================
+
+V18.2 -- PRICE CHARTS (Starting Point)
+----------------------------------------
+  - Time-based sell price history charts for owned properties.
+  - Net worth calculation (cash + half property value).
+  - Player removal handling (V18.1 fix).
+  - 500-entry cap per property on price history.
+  - Price data recorded every 10 seconds.
+
+V18.3 -- INFLATION TRACKER
+----------------------------
+  Changes:
+  - Converted ALL charts from time-based to TURN-BASED x-axis.
+  - Added game turn counter (state.gameTurn, state.turnEndedCount).
+  - Turn detection: currentPlayerIndex wraps to 0.
+  - Added GAME TURN display on the dashboard status bar.
+  - Removed 500-entry cap on price history.
+  - Price/inflation snapshots now recorded once per game turn (not per timer).
+  - NEW: Inflation Tracker overlay panel:
+      * Canvas chart of lobby net worth over game turns.
+      * Stat cards: current net worth, $ change, % change.
+      * Filter buttons: ALL, 5, 10, 20, 50, 100 turns.
+      * $ and % change recalculate relative to the filtered window.
+      * Auto-refresh every 10 seconds while panel is open.
+
+V18.4 -- SMART INFLATION
+--------------------------
+  Changes:
+  - Added state.inflationOffset for bankruptcy cash absorption.
+  - handlePlayerRemoved now captures playerCash before deletion and adds it
+    to inflationOffset.
+  - recordInflationSnapshot applies the offset: adjustedNet = lobbyNet +
+    inflationOffset.
+  - Inflation snapshot recorded immediately after bankruptcy (not deferred
+    to next turn boundary).
+  - Offset resets on new game start.
+  - No UI changes -- the math change is invisible to the user but produces
+    more accurate charts.
+
+V18.5 -- LIVE TRACKER
+-----------------------
+  Changes:
+  - Added WebSocket connection to external Render-deployed server.
+  - Three live event types sent: reset, snapshot, bankruptcy.
+  - sendLiveSnapshot() called each game turn.
+  - sendLiveReset() called on new game start.
+  - sendLiveBankruptcy() called immediately on player removal.
+  - Connection uses _OriginalWS (the un-proxied WebSocket constructor) to
+    avoid self-interception.
+  - Auto-reconnect on disconnect (5-second retry).
+  - CONFIG.liveTrackerUrl added as configurable endpoint.
+  - Server created: richup-live-tracker/server.js
+      * Express serves static files from public/.
+      * WebSocket server with path-based role detection (/bot vs /view).
+      * In-memory game state, viewers receive fullState on connect.
+      * broadcast() pushes updates to all connected viewers.
+  - Frontend created: richup-live-tracker/public/index.html
+      * Dark-themed professional UI.
+      * Two tabs: Inflation Tracker, Property Values.
+      * Same charting code as injection script, polished for sharing.
+      * Auto-reconnect with green/red status indicator.
+      * Country-based color coding for property series.
+  - Dependencies: express ^4.21.0, ws ^8.18.0.
+  - Deployment: GitHub -> Render auto-deploy.
+
+
+================================================================================
+SECTION 12: EVENT-DRIVEN PROTOCOL HANDLER
+================================================================================
+
+The "brain" of the system is the handleMessage() function, which processes
+every inbound WebSocket message. Messages follow Socket.IO's frame format:
+
+    42/api/game,["event-name", { ...body... }]
+
+The handler strips the Socket.IO prefix, parses the JSON array, and
+dispatches on the event name. Key events handled:
+
+  Game lifecycle:
+    entered-room         -- Initial board state, player list, block data.
+    sync-game-state      -- Full state resync (requested after reconnect or
+                            player departure).
+
+  Turn management:
+    your-turn            -- Bot's turn begins. Triggers auto-roll.
+    dices-rolled         -- Dice results received. Triggers auto-buy and
+                            auto-mortgage sequence.
+    turn-ended           -- Any player's turn ended. Updates
+                            currentPlayerIndex. Detects game turn completion.
+
+  Property transactions:
+    property-bought      -- Updates block ownership. Triggers negotiation
+                            scanning.
+    property-mortgaged   -- Updates block mortgage status.
+    property-unmortgaged -- Updates block mortgage status.
+
+  Financial events:
+    money-changed        -- Updates player cash. Triggers debt detection.
+    paid-out-of-prison   -- Informational logging.
+    bonus-card           -- Chance/Community Chest card drawn.
+
+  Player lifecycle:
+    player-left          -- Player departure. Triggers handlePlayerRemoved.
+    player-bankrupt      -- Bankruptcy. Triggers handlePlayerRemoved.
+    player-eliminated    -- Elimination. Triggers handlePlayerRemoved.
+    player-disconnected  -- Disconnect. Triggers handlePlayerRemoved.
+    player-removed       -- Generic removal. Triggers handlePlayerRemoved.
+
+  Trade management:
+    trade-proposed       -- Incoming trade. Auto-declined via WS.
+    trade-accepted       -- Trade completed. Updates block ownership.
+    trade-declined       -- Trade rejected. Updates negotiation state.
+
+
+================================================================================
+SECTION 13: INFRASTRUCTURE & DEPLOYMENT
+================================================================================
+
+  Repository Structure:
+    richup-live-tracker/
+      server.js              -- Express + WebSocket server (142 lines)
+      package.json           -- name, version, dependencies, start script
+      public/
+        index.html           -- Viewer frontend (633 lines)
+
+  Dependencies (production):
+    express    ^4.21.0       -- HTTP server, static file serving
+    ws         ^8.18.0       -- WebSocket server (ws library)
+
+  Deployment Pipeline:
+    1. Code pushed to GitHub via GitHub CLI.
+    2. Render watches the GitHub repository.
+    3. On push, Render auto-builds and deploys.
+    4. Server listens on process.env.PORT (Render-assigned) or 3000.
+
+  Client Scripts (not deployed, pasted manually):
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.2_PRICE_CHARTS.txt
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.3_INFLATION_TRACKER.txt
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.4_SMART_INFLATION.txt
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.5_LIVE_TRACKER.txt
+
+  Each version is a self-contained IIFE that can be copy-pasted into a
+  browser console. No build step, no transpilation, no dependencies.
+
+
+================================================================================
+SECTION 14: ANTI-GLITCH GUARDS & EDGE CASE HANDLING
+================================================================================
+
+  - Re-injection safety: On script paste, all previous intervals
+    (window.__magnateMainLoop, window.__magnateWsScan) are cleared, event
+    listeners (window.__magnateVisHandler) are removed, and DOM elements
+    (mag-v17, mag-props-panel, mag-charts-panel, mag-inflation-panel) are
+    removed before re-creation.
+
+  - Double-roll prevention: The diceRolled flag is set only when the
+    "dices-rolled" event arrives (server confirmation), not on send. This
+    prevents the backup main loop from sending redundant roll commands.
+
+  - Mortgage safety timeout: state.mortgagingDone is set to false when
+    mortgage automation begins and true on completion. A 10-second safety
+    timeout releases the lock in case the mortgage flow stalls, preventing
+    the auto-end-turn system from being permanently blocked.
+
+  - Money change threshold: Large, unexplained money changes are logged
+    with warnings for manual review rather than acted upon blindly.
+
+  - Adaptive WebSocket scanner: Starts at 500ms, slows to 2s, then 5s.
+    Prevents CPU waste on long-running sessions while maintaining
+    responsiveness during initial connection.
+
+  - MutationObserver auto-disconnect: The DOM observer disconnects after
+    2 minutes to prevent performance degradation in long games.
+
+  - Trade safety: All automatic button clicking is suppressed when any
+    trade UI is detected. The check walks the DOM tree from each candidate
+    button upward to its ancestors, scanning class names and text content
+    for trade-related keywords.
+
+  - Player removal cascading: When a player is removed, the system:
+    (1) Captures their cash for inflation offset.
+    (2) Deletes them from state.players.
+    (3) Clears ownerId on all their properties.
+    (4) Removes them from participantsOrder.
+    (5) Adjusts currentPlayerIndex to prevent off-by-one turn tracking.
+    (6) Cancels any active negotiations targeting the removed player.
+    (7) Forces immediate lobbyNet recalculation.
+    (8) Records an immediate inflation snapshot.
+    (9) Pushes a bankruptcy event to the live tracker.
+    (10) Requests a full state sync from the game server.
+
+  - State recovery on mid-game injection: React fiber tree crawling
+    recovers board layout, player data, and bot identity from the live DOM
+    without requiring the initial "entered-room" WebSocket event.
+
+
+================================================================================
+SECTION 15: TECHNICAL CHALLENGES & LESSONS LEARNED
+================================================================================
+
+1. Socket.IO Frame Parsing
+   The game uses Socket.IO, which wraps WebSocket messages with protocol
+   prefixes (e.g., "42/api/game,"). Raw WebSocket interception requires
+   stripping this prefix before JSON parsing. The prefix format is:
+   [message type][namespace],[data]. Only type "42" (event) messages
+   contain game data.
+
+2. React Fiber Traversal Brittleness
+   Fiber tree structure can change between React versions. The script uses
+   defensive traversal with depth limits, null checks, and try/catch
+   wrappers. It searches for data shapes (arrays with .price, .countryId)
+   rather than relying on specific component names or tree positions.
+
+3. UI Automation on React Components
+   Standard DOM .click() calls often do nothing on React components because
+   React uses its own synthetic event system. The script works around this
+   by finding the React fiber attached to each DOM element and directly
+   invoking the memoizedProps.onClick or memoizedProps.onPointerUp handler
+   with a fabricated event object.
+
+4. WebSocket Self-Interception
+   The constructor proxy intercepts ALL WebSocket creation, including the
+   bot's own connection to the live tracker server. This is solved by using
+   the saved _OriginalWS constructor for the live tracker connection,
+   bypassing the proxy entirely.
+
+5. Turn Boundary Detection
+   Detecting when "all players have completed one round" is non-trivial
+   because players can be eliminated mid-round, changing the total count
+   and shifting indices. The script tracks state.turnEndedCount and compares
+   it against state.participantsOrder.length. When currentPlayerIndex wraps
+   to 0, a new game turn is recorded.
+
+6. Inflation Chart Accuracy vs. Simplicity
+   The full divisor method (Approach 1 in Section 6) would have been simpler
+   to implement but would have produced misleading charts specific to
+   Richup's no-auction bankruptcy mechanic. The chosen offset approach
+   required more careful analysis of edge cases but produces charts that
+   accurately reflect the game's economic reality.
+
+
+================================================================================
+SECTION 16: FILE MANIFEST
+================================================================================
+
+  Client injection scripts (in /home/seeds3/):
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.2_PRICE_CHARTS.txt         (baseline)
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.3_INFLATION_TRACKER.txt     (turn-based)
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.4_SMART_INFLATION.txt       (bankruptcy)
+    RICHUP_MAGNATE_CONSOLE_BOT_V18.5_LIVE_TRACKER.txt          (full-stack)
+
+  Server and frontend (in /home/seeds3/richup-live-tracker/):
+    server.js            -- Express + WebSocket relay server
+    package.json         -- Project metadata and dependencies
+    public/index.html    -- Viewer frontend (dark-themed SPA)
+
+  Backups (in /home/seeds3/backups/):
+    v18.3_inflation_tracker/   -- Snapshot of V18.3 and V18.4 scripts
+    v17.2_mortgage_working/    -- Pre-V18 backup (5 incremental versions)
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

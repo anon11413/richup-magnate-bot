@@ -73,6 +73,7 @@
     // ============================================================
     let _liveWs = null;
     let _liveReconnectTimer = null;
+    let _liveFirstConnect = true;
 
     function connectLiveTracker() {
         if (CONFIG.liveTrackerUrl === 'LIVE_TRACKER_URL_PLACEHOLDER') return;
@@ -81,8 +82,33 @@
         try {
             _liveWs = new _OriginalWS(CONFIG.liveTrackerUrl);
             _liveWs.onopen = () => {
-                addLog("LIVE TRACKER: Connected!", "#e74c3c");
+                addLog(_liveFirstConnect ? "LIVE TRACKER: Connected!" : "LIVE TRACKER: Reconnected!", "#e74c3c");
                 if (_liveReconnectTimer) { clearInterval(_liveReconnectTimer); _liveReconnectTimer = null; }
+
+                // Only reset on first connect (fresh injection) — not on reconnect
+                // so viewers never lose data from a tab-switch/disconnect
+                if (_liveFirstConnect) {
+                    _liveWs.send(JSON.stringify({ type: 'reset' }));
+                    _liveFirstConnect = false;
+                }
+
+                // Build full history dump
+                const prices = {};
+                const propertyNames = {};
+                state.blocks.forEach((b, idx) => {
+                    if (state.priceHistory[idx] && state.priceHistory[idx].length > 0) {
+                        prices[idx] = state.priceHistory[idx];
+                        propertyNames[idx] = { name: b.name || '#' + idx, countryId: b.countryId || '' };
+                    }
+                });
+                _liveWs.send(JSON.stringify({
+                    type: 'fullHistory',
+                    inflationHistory: state.inflationHistory,
+                    priceHistory: prices,
+                    propertyNames: propertyNames,
+                    gameTurn: state.gameTurn,
+                    playerCount: state.participantsOrder.length || Object.keys(state.players).length
+                }));
             };
             _liveWs.onclose = () => {
                 addLog("LIVE TRACKER: Disconnected", "#ff4757");

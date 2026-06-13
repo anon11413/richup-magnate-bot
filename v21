@@ -2744,26 +2744,63 @@ window.__magnateRun = function() {
     // 13. UI CONTROLS
     // ============================================================
     document.getElementById('mag-link').onclick = () => {
-        addLog("CLICK YOUR NAME IN PLAYER LIST...", "#f39c12");
-        document.body.style.cursor = "crosshair";
-        const handler = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            document.body.style.cursor = "default";
-            window.removeEventListener('mousedown', handler, true);
-            const text = e.target.innerText || "";
-            Object.values(state.players).forEach(p => {
-                if (text.includes(p.name) || p.name.includes(text)) {
-                    state.pid = p.id;
-                    state.myPosition = p.position || 0;
-                    state.myMoney = p.money || 0;
-                    addLog("IDENTITY LOCKED: " + p.name, "#2ecc71");
-                    updateMeUI(p.name);
-                    updateStatsUI();
+        // Scan DOM for visible player name elements
+        const allEls = document.querySelectorAll('span, div, p, strong');
+        const nameSet = new Set();
+        const panelEl = document.getElementById('mag-v17');
+        allEls.forEach(el => {
+            if (el.offsetWidth === 0) return;
+            if (panelEl && panelEl.contains(el)) return;
+            const text = (el.innerText || '').trim();
+            if (text && text.length < 40 && /^[A-Za-z0-9_\-\s]+$/.test(text)) {
+                nameSet.add(text);
+            }
+        });
+
+        // Also add names from game state
+        [
+            ...Object.values(state.players),
+            ...(state.participantsOrder || [])
+        ].forEach(p => { if (p.name) nameSet.add(p.name); });
+
+        const names = Array.from(nameSet).sort();
+        if (names.length === 0) {
+            addLog("No players detected yet", "#ff4757");
+            return;
+        }
+
+        // Remove old popup if exists
+        const oldPopup = document.getElementById('mag-id-popup');
+        if (oldPopup) oldPopup.remove();
+
+        const popup = document.createElement('div');
+        popup.id = 'mag-id-popup';
+        popup.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1000001;background:#1e272e;border:2px solid #f39c12;border-radius:10px;padding:16px;max-height:400px;overflow-y:auto;min-width:240px;box-shadow:0 10px 40px rgba(0,0,0,0.9);';
+        popup.innerHTML = '<div style="color:#f39c12;font-weight:bold;font-size:14px;margin-bottom:10px;text-align:center;">Select Your Name</div>' +
+            names.map(n => `<div class="mag-id-opt" data-name="${n.replace(/"/g,'&quot;')}" style="padding:8px 14px;margin:4px 0;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:13px;text-align:center;">${n}</div>`).join('') +
+            '<div class="mag-id-cancel" style="margin-top:8px;padding:6px;background:#c0392b;border:none;border-radius:5px;color:#fff;cursor:pointer;font-size:11px;text-align:center;">CANCEL</div>';
+        document.body.appendChild(popup);
+
+        // Name click
+        popup.querySelectorAll('.mag-id-opt').forEach(el => {
+            el.onclick = () => {
+                const name = el.dataset.name;
+                const p = Object.values(state.players).find(p => p.name === name)
+                    || state.participantsOrder.find(p => p.name === name);
+                if (p) {
+                    if (state.pid) {
+                        state.pid = null; // allow re-link
+                    }
+                    lockIdentity(p);
+                } else {
+                    addLog("Could not find player data for: " + name, "#ff4757");
                 }
-            });
-        };
-        window.addEventListener('mousedown', handler, true);
+                popup.remove();
+            };
+        });
+        popup.querySelector('.mag-id-cancel').onclick = () => popup.remove();
+
+        addLog("IDENTITY: Click your name in the popup", "#f39c12");
     };
 
     document.getElementById('mag-force').onclick = () => {

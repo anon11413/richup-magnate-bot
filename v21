@@ -669,7 +669,8 @@ window.__magnateRun = function() {
             const combined = v.cash + v.propertyValue + v.housingValue;
             upsertByTurn(h.cash, { turn, value: v.cash });
             upsertByTurn(h.propertyValue, { turn, value: v.propertyValue });
-            upsertByTurn(h.housingValue, { turn, value: v.housingValue });
+            const prevH = h.housingValue.length > 0 ? h.housingValue[h.housingValue.length - 1].value : 0;
+            upsertByTurn(h.housingValue, { turn, value: Math.max(v.housingValue, prevH) });
             upsertByTurn(h.combinedTotal, { turn, value: combined });
         });
     }

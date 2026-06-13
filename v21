@@ -1707,6 +1707,7 @@ window.__magnateRun = function() {
 
     function handleGameStarted(body) {
         state.participantsOrder = body.participantsOrder || [];
+        state.players = {};
         state.participantsOrder.forEach(p => { state.players[p.id] = p; });
         state.currentPlayerIndex = 0;
         addLog(`GAME STARTED! ${state.participantsOrder.length} players`, "#f1c40f");

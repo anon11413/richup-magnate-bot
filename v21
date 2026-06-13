@@ -243,6 +243,11 @@ window.__magnateRun = function() {
     if (window.__magnate_liveChartsRefresh) { clearInterval(window.__magnate_liveChartsRefresh); window.__magnate_liveChartsRefresh = null; }
     if (window.__magnate_liveWs) { try { window.__magnate_liveWs.close(); } catch(e) {} window.__magnate_liveWs = null; }
     if (window.__magnate_domObserver) { window.__magnate_domObserver.disconnect(); window.__magnate_domObserver = null; }
+    // Restore native WebSocket to break proxy nesting on re-run
+    if (window.__magnate_originalWS) {
+        window.__magnate_originalWS.prototype.send = window.__magnate_originalSend || window.__magnate_originalWS.prototype.send;
+        window.WebSocket = window.__magnate_originalWS;
+    }
     ['mag-v17','mag-props-panel','mag-charts-panel','mag-inflation-panel','mag-livecharts-panel'].forEach(function(id) {
         var el = document.getElementById(id);
         if (el) el.remove();
@@ -1345,8 +1350,12 @@ window.__magnateRun = function() {
     }
 
     // ---- METHOD 1: WebSocket Constructor Proxy (catches ALL future connections) ----
-    const _OriginalWS = window.WebSocket;
-    const _OriginalSend = _OriginalWS.prototype.send;
+    if (!window.__magnate_originalWS) {
+        window.__magnate_originalWS = window.WebSocket;
+        window.__magnate_originalSend = window.__magnate_originalWS.prototype.send;
+    }
+    const _OriginalWS = window.__magnate_originalWS;
+    const _OriginalSend = window.__magnate_originalSend || _OriginalWS.prototype.send;
     window.WebSocket = function(...args) {
         const ws = new _OriginalWS(...args);
         addLog(`New WS created: ${(args[0]||'').toString().slice(0,50)}`, "#3498db");

@@ -187,10 +187,10 @@ window.__magnateRun = function() {
             if (gtEl) gtEl.innerText = state.gameTurn;
             recordInflationSnapshot();
             recordPriceSnapshot();
-            recordPlayerValueSnapshot();
         }
 
         // Always push to live tracker so site stays current
+
         if (_liveWs && _liveWs.readyState === 1) {
             const inflationEntry = { turn: state.gameTurn, netWorth: currentNet };
             const prices = {};
@@ -2702,7 +2702,6 @@ window.__magnateRun = function() {
                 if (gtEl) gtEl.innerText = state.gameTurn;
                 recordInflationSnapshot();
                 recordPriceSnapshot();
-                recordPlayerValueSnapshot();
             }
         }
 
